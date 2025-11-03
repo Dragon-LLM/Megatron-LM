@@ -31,8 +31,8 @@ except ImportError:
 
 
 @dataclass
-class TransformerConfig(ModelParallelConfig):
-    """Configuration object for megatron-core transformers.
+class DragonConfig(ModelParallelConfig):
+    """Configuration object for megatron-core Dragons.
 
     The initialization function has an argument for each parameter,
     including those in ModelParallelConfig.
@@ -43,7 +43,10 @@ class TransformerConfig(ModelParallelConfig):
     ####################
 
     num_layers: int = 0
-    """Number of transformer layers in a transformer block."""
+    """Number of Dragon layers in a Dragon block."""
+
+    num_attention_layers: int = 0
+    """Number of Dragon attentions layers in a Dragon block."""
 
     mtp_num_layers: Optional[int] = None
     """Number of Multi-Token Prediction (MTP) Layers."""
@@ -52,11 +55,11 @@ class TransformerConfig(ModelParallelConfig):
     """Weighting factor of Multi-Token Prediction (MTP) loss."""
 
     num_layers_in_first_pipeline_stage: Optional[int] = None
-    """Number of transformer layers on first pipeline stage.
+    """Number of Dragon layers on first pipeline stage.
     None implies equal layer division across PP ranks."""
 
     num_layers_in_last_pipeline_stage: Optional[int] = None
-    """Number of transformer layers on last pipeline stage.
+    """Number of Dragon layers on last pipeline stage.
     None implies equal layer division across PP ranks."""
 
     pipeline_model_parallel_layout: Optional[Union[str, list, PipelineParallelLayerLayout]] = None
@@ -71,7 +74,7 @@ class TransformerConfig(ModelParallelConfig):
     in the a-th vpp stage and the b-th pp stage, i.e., vpp(0)pp(0), vpp(0)pp(1), ..., 
     vpp(i)pp(j), vpp(i)pp(j+1), ..., vpp(-1)pp(-2), vpp(-1)pp(-1).
     In the inner lists of layers, 'embedding' or 'E' denotes the embedding layer, 'loss' or 'L'
-    denotes the loss function, and 'decoder' or 't' denotes the transformer decoder layer.
+    denotes the loss function, and 'decoder' or 't' denotes the Dragon decoder layer.
     Examples:
         [['embedding', 'decoder'], ['decoder', 'decoder', 'decoder', 'loss']]:
         pp = 2, vpp = None
@@ -86,21 +89,25 @@ class TransformerConfig(ModelParallelConfig):
         vpp rank 1 pp rank 3 holds: mtp, loss"""
 
     account_for_embedding_in_pipeline_split: bool = False
-    """If set, the embedding layer will be treated as a standard transformer
+    """If set, the embedding layer will be treated as a standard Dragon
     layer in the context of partition and placement for pipeline parallelism."""
 
     account_for_loss_in_pipeline_split: bool = False
-    """If set, the loss layer will be treated as a standard transformer
+    """If set, the loss layer will be treated as a standard Dragon
     layer in the context of partition and placement for pipeline parallelism."""
 
     hidden_size: int = 0
-    """Transformer hidden size."""
+    """Dragon hidden size."""
 
     num_attention_heads: int = 0
-    """Number of transformer attention heads."""
+    """Number of Dragon attention heads."""
+
+    gate_attn: bool = True
+
+    gate_gdn: bool = True
 
     attention_backend: AttnBackend = AttnBackend.auto
-    """Attention backend to run. By default we let transformer engine
+    """Attention backend to run. By default we let Dragon engine
     decide the best backend to run (except in the case of local).
     If attention backend is local we use the local pytorch implementation in mcore.
     Users can specify exact backend by changing this config. """
@@ -117,17 +124,16 @@ class TransformerConfig(ModelParallelConfig):
     """Number of query groups for group query attention. If None, normal attention is used."""
 
     ffn_hidden_size: Optional[int] = None
-    """Transformer Feed-Forward Network hidden size. This is set to 4*hidden_size
+    """Dragon Feed-Forward Network hidden size. This is set to 4*hidden_size
     if not provided."""
 
     kv_channels: Optional[int] = None
-    """Projection weights dimension in multi-head attention. This is set to hidden_size //
-    num_attention_heads if not provided."""
+    """head dim"""
 
-    hidden_dropout: float = 0.1
-    """Dropout probability for transformer hidden state."""
+    hidden_dropout: float = 0.0
+    """Dropout probability for Dragon hidden state."""
 
-    attention_dropout: float = 0.1
+    attention_dropout: float = 0.0
     """Post attention dropout probability."""
 
     fp32_residual_connection: bool = False
@@ -144,7 +150,7 @@ class TransformerConfig(ModelParallelConfig):
     """If set to True, the LayerNorm is adjusted to center the gamma values around 0. This improves
     numerical stability."""
 
-    add_bias_linear: bool = True
+    add_bias_linear: bool = False
     """Include a bias term in all linear layers (QKV projections, after core attention, and two in
     MLP layer)."""
 
@@ -186,11 +192,18 @@ class TransformerConfig(ModelParallelConfig):
     - An integer N: Represents a (N-1):1 ratio, one full attention layer after (N-1) SWA layers.
     - A list that defines a custom pattern, e.g.: [1,1,1,1,0,0,0,0], where 1 represents SWA. """
 
-    normalization: str = "LayerNorm"
+    normalization: str = "RMSNorm"
     """Which norm to use for normalization layers, valid options are `LayerNorm` and `RMSNorm`."""
 
-    qk_layernorm: bool = False
+    qk_layernorm: bool = True
     """Whether to apply `normalization` type of normalization to the query and key embeddings."""
+
+    softcap_attn: float = 0.
+
+    scalable_softmax: bool = True
+
+    p_state_passing: float = 0.
+    """ GDN """
 
     attention_output_gate: bool = False
     """Whether to apply output gate to the attention layers."""
@@ -250,32 +263,11 @@ class TransformerConfig(ModelParallelConfig):
     ####################
     # initialization
     ####################
-    init_method: Optional[Callable] = None
-    """Method to initialize weights. Note that bias is always set to zero. Should be a function that
-    takes a single Tensor and initializes it. If None, will be set to
-    megatron.core.utils.init_method_normal(init_method_std) which is torch nn init normal with
-    mean=0.0 and std=init_method_std."""
+    init_std: float = 1.0
 
-    output_layer_init_method: Optional[Callable] = None
-    """Method to initialize weights of the output layer of both attention and MLP blocks. If None,
-    will be set to megatron.core.utils.scaled_init_method_normal(init_method_std) which is torch nn
-    init normal with mean=0.0 and std=init_method_std / math.sqrt(2.0 * num_layers)."""
+    init_output_std: float = 1.0
 
-    init_method_std: float = 0.02
-    """Standard deviation of the zero mean normal for the default initialization method, not used if
-    init_method and output_layer_init_method are provided."""
-
-    embedding_init_method: Optional[Callable] = None
-    """
-    Method to initialize weights of the embedding layer. If None, will be set as described 
-    in init_method above.
-    """
-
-    embedding_init_method_std: Optional[float] = None
-    """
-    Standard deviation of the zero mean normal for the default initialization method for the 
-    embedding layer. If None, will be set to init_method_std.
-    """
+    init_embedding_std: Optional[float] = None
 
     init_model_with_meta_device: bool = False
     """
@@ -287,7 +279,7 @@ class TransformerConfig(ModelParallelConfig):
     # mixed-precision
     ####################
     apply_query_key_layer_scaling: bool = False
-    """If true, scale Q * K^T by 1 / layer-number. This improve numeric stability when training with
+    """If true, scale Q * K^T by 1 / layer-number. This improves numeric stability when training with
     fp16."""
 
     attention_softmax_in_fp32: bool = True
@@ -1815,8 +1807,8 @@ class TransformerConfig(ModelParallelConfig):
 
 
 @dataclass
-class MLATransformerConfig(TransformerConfig):
-    """Configuration object for megatron-core Multi-Latent Attention (MLA) transformers.
+class MLADragonConfig(DragonConfig):
+    """Configuration object for megatron-core Multi-Latent Attention (MLA) Dragons.
 
     The initialization function has an argument for each parameter, including those in
     ModelParallelConfig. Included YaRN RoPE parameters that is fused in MLA.
