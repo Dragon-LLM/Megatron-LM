@@ -42,6 +42,10 @@ class DragonConfig(ModelParallelConfig):
     # model architecture
     ####################
 
+    use_uscaling: bool = False
+
+    uscaling_tau: float = 0.2
+
     num_layers: int = 0
     """Number of Dragon layers in a Dragon block."""
 
@@ -102,6 +106,8 @@ class DragonConfig(ModelParallelConfig):
     num_attention_heads: int = 0
     """Number of Dragon attention heads."""
 
+    num_signal_heads: int = 0
+
     gate_attn: bool = True
 
     gate_gdn: bool = True
@@ -111,9 +117,6 @@ class DragonConfig(ModelParallelConfig):
     decide the best backend to run (except in the case of local).
     If attention backend is local we use the local pytorch implementation in mcore.
     Users can specify exact backend by changing this config. """
-
-    softmax_scale: Optional[float] = None
-    """Softmax scale for attention scaling."""
 
     softmax_type: Literal['vanilla', 'off-by-one', 'learnable'] = 'vanilla'
     """Applies modified softmax from https://www.evanmiller.org/attention-is-off-by-one.html. 
@@ -204,9 +207,6 @@ class DragonConfig(ModelParallelConfig):
 
     p_state_passing: float = 0.
     """ GDN """
-
-    attention_output_gate: bool = False
-    """Whether to apply output gate to the attention layers."""
 
     test_mode: bool = False
     """Whether to run real-time tests."""
