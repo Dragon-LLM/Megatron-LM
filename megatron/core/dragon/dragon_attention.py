@@ -101,8 +101,6 @@ try:
 except ImportError:
     HAVE_FUSED_QKV_ROPE = False
 
-# TODO: kv shift ! (warning about the TP-aware projection)
-
 @dataclass
 class SelfDiffAttentionSubmodules:
     """
@@ -462,7 +460,7 @@ class DiffAttention(MegatronModule, ABC):
 
     @abstractmethod
     def get_query_key_value_tensors(
-        self, hidden_states, key_value_states, output_gate, split_qkv=True
+        self, hidden_states
     ):
         """
         This method needs to be implemented based on whether the derived class
@@ -737,28 +735,42 @@ class DiffAttention(MegatronModule, ABC):
         # self or cross attn.
         nvtx_range_push(suffix="qkv")
         split_qkv = True
-        output_gate = self.config.gate_attn
         # Check if fused_single_qkv_rope is requested but either unavailable or not
         # supported for the current use case.
         if self.attention_type != "cross":
             assert not (
                 self.config.fused_single_qkv_rope and split_qkv
             ), "fused_single_qkv_rope requested but not available/supported for the config."
-        if output_gate:
-            assert split_qkv, "output_gate is not supported for unsplit mixed_qkv tensor."
 
         if self.offload_qkv_linear:
             hidden_states = fine_grained_offloading_group_start(hidden_states, name="qkv_linear")
         with get_fine_grained_offloading_context(self.offload_qkv_linear):
-            qkv_output = self.get_query_key_value_tensors(hidden_states, output_gate=output_gate)
+            qkv_output = self.get_query_key_value_tensors(hidden_states)
         if self.offload_qkv_linear:
             (qkv_output,) = fine_grained_offloading_group_commit(
                 qkv_output, name="qkv_linear", forced_released_tensors=[]
             )
 
         attn_mask_type = self.attn_mask_type
-        query, key, value, alpha_k, alpha_v, gate = qkv_output # (L, B, H_local, dk), (L, B, H_local, dk), (L, B, H_noise_local, dk), (L, B, H_local, dk)
+        query, key, value, alpha_k, alpha_v, gate = qkv_output
         nvtx_range_pop(suffix="qkv")
+
+        # query: (L, B, H_local, dk), key: (L, B, H_local, dk), value: (L, B, H_noise_local, dk), gate: (L, B, H_local, dk)
+        # alpha_k: (L, B, H_local, 1), alpha_v: (L, B, H_noise_local, 1)
+
+        # =====================
+        # kv shift
+        # =====================
+        # TODO: work with cu_seqlens!!!! (see old HF code, which now works with position ids)
+        if self.config.token_shift:
+            alpha_k = torch.sigmoid(alpha_k.float()).float().to(key.dtype) # (L, B, H_local, 1)
+            alpha_v = torch.sigmoid(alpha_v.float()).float().to(value.dtype) # (L, B, H_noise_local, 1)
+
+            key_prev = torch.nn.functional.pad(key, (0, 0, 0, 0, 1, 0))[:, :-1] # (L, B, H_local, D)
+            value_prev = torch.nn.functional.pad(value, (0, 0, 0, 0, 1, 0))[:, :-1] # (L,B, H_noise_local, D)
+
+            key = alpha_k * key_prev + (1 - alpha_k) * key
+            value = alpha_v * value_prev + (1 - alpha_v) * value
 
         # ===================================================
         # Adjust key, value, and rotary_pos_emb for inference
@@ -1015,10 +1027,10 @@ class DiffAttention(MegatronModule, ABC):
 
     @torch.compile
     def _torch_compiled_output_gate(self, x, gate):
+        # TODO: ZCG4
         x_dtype = x.dtype
-        gate = gate.contiguous()
-        gate = gate.view(*x.shape)
-        x = x * torch.sigmoid(gate.float())
+        gate = gate.contiguous().view(*x.shape)
+        x = x * torch.silu(gate.float())
         x = x.to(x_dtype)
         return x
 
@@ -1053,7 +1065,9 @@ class SelfDiffAttention(DiffAttention):
             pg_collection=pg_collection,
         )
 
-        self.linear_qkag_out_dim = self.query_projection_size + self.kv_projection_size + self.num_attention_heads
+        self.linear_qkag_out_dim = self.query_projection_size + self.kv_projection_size
+        if self.config.token_shift:
+            self.linear_qkag_out_dim += + self.num_attention_heads
         if self.config.gate_attn:
             self.linear_qkag_out_dim += self.config.kv_channels * self.num_attention_heads
         self.linear_qkag = build_module(
@@ -1069,7 +1083,9 @@ class SelfDiffAttention(DiffAttention):
             tp_comm_buffer_name='qkag',
             tp_group=self.pg_collection.tp,
         )
-        self.linear_va_out_dim = self.num_noise_heads * self.config.kv_channels + self.num_noise_heads
+        self.linear_va_out_dim = self.num_noise_heads * self.config.kv_channels
+        if self.config.token_shift:
+            self.linear_va_out_dim += self.num_noise_heads
         self.linear_va = build_module(
             submodules.linear_va,
             self.config.hidden_size,
@@ -1175,22 +1191,28 @@ class SelfDiffAttention(DiffAttention):
                 "TP",
             )
 
-    def get_query_key_value_tensors(self, hidden_states, output_gate=False):
+    def get_query_key_value_tensors(self, hidden_states):
+        # project to q, k, (alpha_k), (gate)
         mixed_qkag, _ = self.linear_qkag(hidden_states) # [L, B, H_local * D]
         mixed_qkag = rearrange(mixed_qkag, "l b (h p) -> l b h p", h=self.num_attention_heads_per_partition)#.contiguous()
-        # split per head: [L, B, H_local, dq/dk/1/(do)] where dq=dk=do (do=0 if no output gate)
-        q = mixed_qkag[..., 0:self.key_hidden_size]
-        k = mixed_qkag[..., self.key_hidden_size:2*self.key_hidden_size]
-        alpha_k = mixed_qkag[..., 2*self.key_hidden_size:2*self.key_hidden_size+1]
+        # split per head: [L, B, H_local, dq/dk/(1)/(do)] where dq=dk=do
+        q = mixed_qkag[..., 0:self.key_hidden_size]; accum = self.key_hidden_size
+        k = mixed_qkag[..., accum:accum+self.key_hidden_size]; accum += self.key_hidden_size
+        alpha_k = None
         gate = None
-        if output_gate:
-            gate = mixed_qkag[..., 2*self.key_hidden_size:]
+        if self.config.token_shift:
+            alpha_k = mixed_qkag[..., accum:accum+1]; accum += 1
+        if self.config.gate_attn:
+            gate = mixed_qkag[..., accum:]
         
+        # project to v, (alpha_v)
         mixed_va, _ = self.linear_va(hidden_states) # [L, B, H_noise_local * D]
         mixed_va = rearrange(mixed_va, "l b (h p) -> l b h p", h=self.num_noise_heads_per_partition)#.contiguous()
-        # split per head: [L, B, H_noise_local, dv/1] where dq=dv
-        v = mixed_va[..., 0:self.val_hidden_size]
-        alpha_v = mixed_va[..., self.val_hidden_size:]
+        # split per head: [L, B, H_noise_local, dv/(1)] where dq=dv
+        v = mixed_va[..., 0:self.val_hidden_size]; accum = self.val_hidden_size
+        alpha_v = None
+        if self.config.token_shift:
+            alpha_v = mixed_va[..., accum:]
 
         if self.q_layernorm is not None:
             q = self.q_layernorm(q)

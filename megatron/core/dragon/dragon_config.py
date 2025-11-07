@@ -108,6 +108,8 @@ class DragonConfig(ModelParallelConfig):
 
     num_signal_heads: int = 0
 
+    token_shift: bool = True
+
     gate_attn: bool = True
 
     gate_gdn: bool = True
