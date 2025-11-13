@@ -9,6 +9,8 @@ import logging
 from dataclasses import dataclass, replace
 from typing import List, Optional, Tuple, Union
 from einops import rearrange
+from contextlib import nullcontext
+import math
 
 import torch
 import torch.nn as nn
@@ -34,17 +36,15 @@ from megatron.core.utils import deprecate_inference_params, nvtx_range_pop, nvtx
 from .dragon_config import DragonConfig
 
 # TODO : state passing
-
-# TODO: Implement GatedDeltaNetContextParallel
-# from .gated_delta_net_context_parallel import GatedDeltaNetContextParallel
+# TODO : uscaling
 
 try:
-    from fla.modules.l2norm import l2norm
     from fla.ops.gated_delta_rule import chunk_gated_delta_rule
+    from fla.ops.utils import prepare_sequence_ids
 
     HAVE_FLA = True
 except ImportError:
-    chunk_gated_delta_rule = None
+    chunk_gated_delta_rule, prepare_sequence_ids = None, None
 
     HAVE_FLA = False
 
@@ -116,7 +116,6 @@ class GatedDeltaNet(MegatronModule):
         self.tp_size = self.pg_collection.tp.size()
         self.sp_size = self.tp_size if config.sequence_parallel else 1
 
-        # Attributes from config
         self.config = config
         self.hidden_size = config.hidden_size
         self.conv_kernel_dim = config.linear_conv_kernel_dim
@@ -131,9 +130,6 @@ class GatedDeltaNet(MegatronModule):
         self.num_heads = self.num_key_heads
         self.num_heads_local = self.num_heads // self.tp_size
 
-        # Input projection (hidden_states -> q, k, v, gate, beta, alpha)
-        # TODO: for now, output gate is forced for GDN.
-        # We may remove this restriction in the future.
         self.in_proj_dim = self.qk_dim * 2 + self.v_dim * 2 + self.num_value_heads * 2
         if self.config.fp8:
             fp8_align_size = get_fp8_align_size(self.config.fp8_recipe)
@@ -155,7 +151,6 @@ class GatedDeltaNet(MegatronModule):
             tp_group=self.pg_collection.tp,
         )
 
-        # Conv1d for QKV
         self.conv_dim = self.qk_dim * 2 + self.v_dim
         self.conv_dim_local_tp = self.conv_dim // self.tp_size
 
@@ -196,31 +191,37 @@ class GatedDeltaNet(MegatronModule):
         )
         setattr(self.A_log, "tensor_model_parallel", True)
 
-        # TODO: support CP
-
         self.reset_parameters()
 
     def reset_parameters(self):
         """Reset the parameters."""
         if self.config.perform_initialization:
-            with get_cuda_rng_tracker().fork():
+            #with get_cuda_rng_tracker().fork():
+            with nullcontext(): # TODO TEMP
                 # conv1d.weight
                 if self.conv_init is not None:
                     nn.init.uniform_(self.conv1d.weight, -self.conv_init, self.conv_init)
                 # dt_bias
-                torch.ones(
-                    self.num_v_heads_local_tp,
-                    out=self.dt_bias.data,
-                    dtype=self.config.params_dtype,
-                    device=torch.cuda.current_device(),
+                dt_min = 0.001
+                dt_max = 0.1
+                dt_init_floor = 1e-4
+                dt = torch.exp(
+                    torch.rand(self.num_heads_local) * (math.log(dt_max) - math.log(dt_min))
+                    + math.log(dt_min)
                 )
+                dt = torch.clamp(dt, min=dt_init_floor)
+                # Inverse of softplus: https://github.com/pytorch/pytorch/issues/72759
+                inv_dt = dt + torch.log(-torch.expm1(-dt))
+                with torch.no_grad():
+                    self.dt_bias.data.copy_(inv_dt)
                 # A_log
                 A = torch.empty(
                     self.num_v_heads_local_tp,
                     dtype=self.config.params_dtype,
                     device=torch.cuda.current_device(),
                 ).uniform_(*self.A_init_range)
-                self.A_log.data.copy_(A)
+                with torch.no_grad():
+                    self.A_log.data.copy_(torch.log(A))
 
     def forward(
         self,
@@ -276,10 +277,6 @@ class GatedDeltaNet(MegatronModule):
             # TODO: support inference
             raise NotImplementedError("GDN does not support inference for now.")
 
-        if packed_seq_params is not None:
-            # TODO: support packed sequence
-            raise NotImplementedError("GDN does not support packed sequence for now.")
-
         # Input projection
         nvtx_range_push(suffix="in_proj")
         qkvzba, _ = self.in_proj(hidden_states)
@@ -289,25 +286,31 @@ class GatedDeltaNet(MegatronModule):
         # split per head: [L, B, H_local, dk+dk+dv/dv/1/1] where dq=dk=do
         qkv = qkvzba[..., :2*self.key_head_dim+self.value_head_dim]; accum = 2*self.key_head_dim+self.value_head_dim
         gate = qkvzba[..., accum:accum+self.value_head_dim]; accum += self.value_head_dim
-        beta = qkvzba[..., accum:accum+1]; accum += 1
-        alpha = qkvzba[..., accum:accum+1]
+        beta = qkvzba[..., accum:accum+1].squeeze(-1); accum += 1
+        alpha = qkvzba[..., accum:accum+1].squeeze(-1)
 
         # qkv: (B, L, H_local, D)
         # gate: (B, L, H_local, Dv)
-        # beta: (B, L, H_local, 1)
-        # alpha: (B, L, H_local, 1)
+        # beta: (B, L, H_local)
+        # alpha: (B, L, H_local)
 
         # Convolution on qkv
-        qkv = rearrange(qkv, 'b l h d -> b (h d) l')
+        #qkv = rearrange(qkv, 'b l h d -> b (h d) l')
+        qkv = rearrange(qkv, 'b l h d -> b l (h d)')
+        qkv = qkv.transpose(1, 2)
         nvtx_range_push(suffix="conv1d")
         if causal_conv1d_fn is None:
             qkv = F.silu(self.conv1d(qkv)[..., :seq_len])
         else:
+            seq_idx = None
+            if packed_seq_params is not None:
+                seq_idx = prepare_sequence_ids(packed_seq_params.cu_seqlens_q).to(torch.int32).unsqueeze(0)
             qkv = causal_conv1d_fn(
                 x=qkv,
                 weight=self.conv1d.weight.squeeze(1), # d, 1, w -> d, w
                 bias=self.conv1d.bias,
                 activation='silu',
+                seq_idx=seq_idx,
             )
         nvtx_range_pop(suffix="conv1d")
         # Split qkv into query, key, and value
@@ -342,6 +345,7 @@ class GatedDeltaNet(MegatronModule):
             initial_state=None,
             output_final_state=False,
             use_qk_l2norm_in_kernel=self.use_qk_l2norm,
+            cu_seqlens=packed_seq_params.cu_seqlens_q if packed_seq_params is not None else None,
         )
         nvtx_range_pop(suffix="gated_delta_rule")
 
@@ -360,7 +364,7 @@ class GatedDeltaNet(MegatronModule):
         # TODO: ZCG4
         x_dtype = x.dtype
         gate = gate.contiguous().view(*x.shape)
-        x = x * torch.silu(gate.float())
+        x = x * F.silu(gate.float())
         x = x.to(x_dtype)
         return x
     

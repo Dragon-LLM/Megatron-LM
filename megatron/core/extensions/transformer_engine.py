@@ -848,8 +848,11 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         attention_type: str,
         attention_dropout: Optional[float] = None,
         softmax_scale: Optional[float] = None,
+        num_attention_heads: Optional[int] = None,
+        num_query_groups: Optional[int] = None,
         k_channels: Optional[int] = None,
         v_channels: Optional[int] = None,
+        softcap: Optional[float] = None,
         cp_comm_type: str = "p2p",
         pg_collection: ProcessGroupCollection = None,
     ):
@@ -874,15 +877,11 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             )
 
         extra_kwargs: dict[str, Any] = {}
-        if is_te_min_version("0.11.0"):
-            extra_kwargs["num_gqa_groups"] = self.config.num_query_groups
-        elif self.config.num_query_groups != self.config.num_attention_heads:
-            raise ValueError(
-                f"Transformer Engine v{get_te_version()} does not support Grouped Query Attention, "
-                f"use a newer version of Transformer Engine. "
-                f"(num_query_groups ({self.config.num_query_groups}) != "
-                f"num_attention_heads ({self.config.num_attention_heads}))"
-            )
+        extra_kwargs["num_gqa_groups"] = num_query_groups
+
+        if softcap is None:
+            softcap = getattr(self.config, "softcap_attn", 0.)
+        extra_kwargs["softcap"] = softcap
 
         if pg_collection is None:
             pg_collection = ProcessGroupCollection(
@@ -991,7 +990,7 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             self.kept_packed_seq_params.discard("cu_seqlens_kv_padded")
 
         super().__init__(
-            num_attention_heads=self.config.num_attention_heads,
+            num_attention_heads=num_attention_heads,
             kv_channels=kv_channels,
             attention_dropout=(
                 self.config.attention_dropout if attention_dropout is None else attention_dropout
@@ -1015,6 +1014,8 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         attention_mask: Tensor,
         attn_mask_type: AttnMaskType,
         attention_bias: Tensor = None,
+        window_size: Optional[Tuple[int, int]] = None,
+        concat_heads: bool = True,
         packed_seq_params: PackedSeqParams = None,
     ):
         """Forward."""
@@ -1023,7 +1024,10 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             if packed_seq_params is not None
             else {}
         )
-        qkv_format = packed_seq_kwargs.get('qkv_format', self.qkv_format)
+        if packed_seq_params is None:
+            qkv_format = self.qkv_format
+        else:
+            qkv_format = packed_seq_kwargs.get('qkv_format', self.qkv_format)
 
         attention_bias_kwargs = {}
         if attention_bias is not None:
@@ -1056,12 +1060,14 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
                 value,
                 attention_mask,
                 attn_mask_type=attn_mask_type.name,
+                window_size=window_size,
+                concat_heads=concat_heads,
                 **attention_bias_kwargs,
                 **packed_seq_kwargs,
             )
         else:
             core_attn_out = super().forward(
-                query, key, value, attention_mask, **attention_bias_kwargs, **packed_seq_kwargs
+                query, key, value, attention_mask, concat_heads=concat_heads, **attention_bias_kwargs, **packed_seq_kwargs
             )
 
         return core_attn_out

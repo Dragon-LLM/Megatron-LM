@@ -3,6 +3,7 @@
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import NoReturn, Optional, Tuple, Union
+from contextlib import nullcontext
 import math
 
 import torch
@@ -107,8 +108,8 @@ class SelfDiffAttentionSubmodules:
     Configuration class for specifying the submodules of a self-attention.
     """
 
-    linear_qkag: Union[ModuleSpec, type] = None
-    linear_va: Union[ModuleSpec, type] = None
+    linear_in: Union[ModuleSpec, type] = None
+    linear_BkBv: Union[ModuleSpec, type] = None
     core_attention: Union[ModuleSpec, type] = None
     q_layernorm: Union[ModuleSpec, type] = None
     k_layernorm: Union[ModuleSpec, type] = None
@@ -161,6 +162,7 @@ class DiffAttention(MegatronModule, ABC):
             self.query_projection_size, self.num_attention_heads
         )
         self.num_attention_heads_per_partition = divide(self.num_attention_heads, world_size)
+        self.num_signal_heads_per_partition = divide(self.num_signal_heads, world_size)
         self.num_noise_heads_per_partition = divide(self.num_noise_heads, world_size)
         self.num_query_groups_per_partition = divide(self.config.num_query_groups, world_size)
 
@@ -169,16 +171,16 @@ class DiffAttention(MegatronModule, ABC):
         self.val_hidden_size = self.hidden_size_per_attention_head
 
         # Scalable softmax scalers
-        self.softmax_scaler = torch.nn.Parameter(torch.ones(1, 1, self.num_attention_heads_per_partition, 1))
+        if not config.intra_doc_masking:
+            self.softmax_scaler = torch.nn.Parameter(torch.ones(1, 1, self.num_attention_heads_per_partition, 1))
+        else:
+            self.softmax_scaler = torch.nn.Parameter(torch.ones(1, self.num_attention_heads_per_partition, 1))
         setattr(self.softmax_scaler, 'tensor_model_parallel', True)
-        self.cached_log_pos = None
-        self.cached_T = None
-        self.cached_start_pos = None
-        self.cached_wsize = None
 
         # Diff attention scalers
         self.lambda_init = 0.8 - 0.6 * math.exp(-0.3 * layer_number)
-        with get_cuda_rng_tracker().fork():
+        #with get_cuda_rng_tracker().fork():
+        with nullcontext(): # TODO TEMP
             head_dim = self.hidden_size_per_attention_head // 2
             self.lambda_q1 = torch.nn.Parameter(torch.zeros(head_dim, dtype=torch.float32).normal_(mean=0,std=0.1))
             self.lambda_k1 = torch.nn.Parameter(torch.zeros(head_dim, dtype=torch.float32).normal_(mean=0,std=0.1))
@@ -190,14 +192,30 @@ class DiffAttention(MegatronModule, ABC):
 
         self.softcap = self.config.softcap_attn
 
-        self.core_attention = build_module(
+        self.core_attention1 = build_module(
             submodules.core_attention,
             config=self.config,
             layer_number=self.layer_number,
             attn_mask_type=self.attn_mask_type,
             attention_type=self.attention_type,
+            num_attention_heads=self.num_signal_heads,
+            num_query_groups=self.num_signal_heads,
             cp_comm_type=cp_comm_type,
             softmax_scale=None if not self.config.use_uscaling else 1/self.key_hidden_size,
+            softcap=self.softcap,
+            pg_collection=self.pg_collection,
+        )
+        self.core_attention2 = build_module(
+            submodules.core_attention,
+            config=self.config,
+            layer_number=self.layer_number,
+            attn_mask_type=self.attn_mask_type,
+            attention_type=self.attention_type,
+            num_attention_heads=self.num_noise_heads,
+            num_query_groups=self.num_noise_heads,
+            cp_comm_type=cp_comm_type,
+            softmax_scale=None if not self.config.use_uscaling else 1/self.key_hidden_size,
+            softcap=self.softcap,
             pg_collection=self.pg_collection,
         )
 
@@ -222,6 +240,8 @@ class DiffAttention(MegatronModule, ABC):
         )
 
         self.wsize_prev = None
+
+        self.register_buffer("inv_rank", torch.tensor(1./self.config.tpa_rank), persistent=False)
 
     def _checkpointed_attention_forward(
         self,
@@ -461,6 +481,24 @@ class DiffAttention(MegatronModule, ABC):
     @abstractmethod
     def get_query_key_value_tensors(
         self, hidden_states
+    ):
+        """
+        This method needs to be implemented based on whether the derived class
+        is "self-attn" or "cross-attn".
+        """
+
+    @abstractmethod
+    def get_gate_tensor(
+        self, hidden_states
+    ):
+        """
+        This method needs to be implemented based on whether the derived class
+        is "self-attn" or "cross-attn".
+        """
+    
+    @abstractmethod
+    def normalize_qk(
+        self, q, k
     ):
         """
         This method needs to be implemented based on whether the derived class
@@ -752,25 +790,31 @@ class DiffAttention(MegatronModule, ABC):
             )
 
         attn_mask_type = self.attn_mask_type
-        query, key, value, alpha_k, alpha_v, gate = qkv_output
-        nvtx_range_pop(suffix="qkv")
+        query, A_k, A_v, B_k, B_v, alpha_k, alpha_v, gate = qkv_output
 
-        # query: (L, B, H_local, dk), key: (L, B, H_local, dk), value: (L, B, H_noise_local, dk), gate: (L, B, H_local, dk)
-        # alpha_k: (L, B, H_local, 1), alpha_v: (L, B, H_noise_local, 1)
+        # q: [L, B, H_local, dk]
+        # A_k: [L, B, H_local, r], A_v: [L, B, H_noise_local, r]
+        # alpha_k: [L, B, H_local, 1], alpha_v: [L, B, H_noise_local, 1]
+        # B_k: [L, B, r*Dk], B_v: [L, B, r*Dk]
+        # gate: [L, B, H_signal_local, Dk]
+
+        B_k = rearrange(B_k, '... (r d) -> ... r d', r=self.config.tpa_rank)
+        B_v = rearrange(B_v, '... (r d) -> ... r d', r=self.config.tpa_rank)
+        key = torch.matmul(A_k, B_k).mul_(self.inv_rank)
+        value = torch.matmul(A_v, B_v).mul_(self.inv_rank)
+
+        nvtx_range_pop(suffix="qkv")
 
         # =====================
         # kv shift
         # =====================
-        # TODO: work with cu_seqlens!!!! (see old HF code, which now works with position ids)
         if self.config.token_shift:
-            alpha_k = torch.sigmoid(alpha_k.float()).float().to(key.dtype) # (L, B, H_local, 1)
-            alpha_v = torch.sigmoid(alpha_v.float()).float().to(value.dtype) # (L, B, H_noise_local, 1)
+            key, value = self._torch_compiled_token_shift(key, value, alpha_k, alpha_v, position_ids=packed_seq_params.position_ids if packed_seq_params is not None else None)
 
-            key_prev = torch.nn.functional.pad(key, (0, 0, 0, 0, 1, 0))[:, :-1] # (L, B, H_local, D)
-            value_prev = torch.nn.functional.pad(value, (0, 0, 0, 0, 1, 0))[:, :-1] # (L,B, H_noise_local, D)
-
-            key = alpha_k * key_prev + (1 - alpha_k) * key
-            value = alpha_v * value_prev + (1 - alpha_v) * value
+        # =====================
+        # QK-norm
+        # =====================
+        query, key = self.normalize_qk(query, key)
 
         # ===================================================
         # Adjust key, value, and rotary_pos_emb for inference
@@ -892,17 +936,13 @@ class DiffAttention(MegatronModule, ABC):
         T = query.size(0)
         wsize = window_size[0] if window_size is not None else -1
         if self.config.scalable_softmax:
-            if self.cached_start_pos == start_pos and self.cached_T == T and self.cached_wsize == wsize and self.cached_log_pos is not None:
-                # reuse precomputed log_pos
-                log_pos = self.cached_log_pos
+            if packed_seq_params is not None:
+                position_ids = packed_seq_params.position_ids+1 # (T,)
             else:
-                # recompute and update cache
-                pos = torch.arange(start_pos+1, start_pos+T+1, device=query.device).view(T, 1, 1, 1).to(query.dtype)
-                log_pos = pos.log() if wsize <= 0 else torch.clamp_max(pos, wsize).log()
-                self.cached_log_pos = log_pos
-                self.cached_start_pos = start_pos
-                self.cached_T = T
-                self.cached_wsize = wsize
+                position_ids = torch.arange(start_pos+1, start_pos+T+1, dtype=torch.long, device=query.device) # (T,)
+            pos_shape = (query.size(0),) + (1,) * (query.dim() - 1)
+            pos = (position_ids.to(torch.float32).view(*pos_shape))
+            log_pos = pos.log() if wsize <= 0 else torch.clamp_max(pos, wsize).log()
             query = (self.softmax_scaler * log_pos) * query
 
         # ==================================
@@ -910,9 +950,16 @@ class DiffAttention(MegatronModule, ABC):
         # ==================================
         sig_idx, noi_idx = self._signal_noise_local_indices(self.pg_collection.tp.rank(), query.device)
 
-        query_sig, query_noi = query.index_select(2, sig_idx), query.index_select(2, noi_idx)
-        key_sig, key_noi = key.index_select(2, sig_idx), key.index_select(2, noi_idx)
-        value_sig = value.repeat(1, 1, self.num_signal_heads//self.num_noise_heads, 1)
+        if packed_seq_params is None:
+            index_heads = 2
+            query_sig, query_noi = query.index_select(index_heads, sig_idx), query.index_select(index_heads, noi_idx)
+            key_sig, key_noi = key.index_select(index_heads, sig_idx), key.index_select(index_heads, noi_idx)
+            value_sig = value.repeat(1, 1, self.num_signal_heads//self.num_noise_heads, 1)
+        else:
+            index_heads = 1
+            query_sig, query_noi = query.index_select(index_heads, sig_idx), query.index_select(index_heads, noi_idx)
+            key_sig, key_noi = key.index_select(index_heads, sig_idx), key.index_select(index_heads, noi_idx)
+            value_sig = value.repeat(1, self.num_signal_heads//self.num_noise_heads, 1)
 
         # query_sig, key_sig, value_sig: (L, B, H_signal_local, D)
         # query_noi, key_noi, value    : (L, B, H_noise_local, D)
@@ -949,26 +996,42 @@ class DiffAttention(MegatronModule, ABC):
             if inference_context is None or inference_context.is_static_batching():
                 # Static batching attention kernel.
                 with get_fine_grained_offloading_context(self.offload_core_attention):
-                    core_attn_out_1 = self.core_attention(
-                        query_sig,
-                        key_sig,
-                        value_sig,
+                    core_attn_out_1 = self.core_attention1(
+                        query_sig.bfloat16(),
+                        key_sig.bfloat16(),
+                        value_sig.bfloat16(),
                         attention_mask,
                         attn_mask_type=attn_mask_type,
                         attention_bias=attention_bias,
+                        window_size=window_size,
+                        concat_heads=False,
                         packed_seq_params=packed_seq_params,
                     ) # (L, B, H_signal_local, D)
-                    assert len(core_attn_out_1.shape) == 4
-                    core_attn_out_2 = self.core_attention(
-                        query_noi,
-                        key_noi,
-                        value,
+                    core_attn_out_2 = self.core_attention2(
+                        query_noi.bfloat16(),
+                        key_noi.bfloat16(),
+                        value.bfloat16(),
                         attention_mask,
                         attn_mask_type=attn_mask_type,
                         attention_bias=attention_bias,
+                        window_size=window_size,
+                        concat_heads=False,
                         packed_seq_params=packed_seq_params,
                     ) # (L, B, H_noise_local, D)
-                    core_attn_out_2 = core_attn_out_2.repeat(1, 1, self.num_signal_heads//self.num_noise_heads, 1) # (L, B, H_signal_local, D)
+                    if not self.config.intra_doc_masking:
+                        assert len(core_attn_out_1.shape) == 4
+                        assert len(core_attn_out_2.shape) == 4
+                    else:
+                        assert len(core_attn_out_1.shape) == 3
+                        assert len(core_attn_out_2.shape) == 3
+                    assert core_attn_out_1.size(-2) == self.num_signal_heads_per_partition
+                    assert core_attn_out_1.size(-1) == self.hidden_size_per_attention_head
+                    assert core_attn_out_2.size(-2) == self.num_noise_heads_per_partition
+                    assert core_attn_out_2.size(-1) == self.hidden_size_per_attention_head
+                    if not self.config.intra_doc_masking:
+                        core_attn_out_2 = core_attn_out_2.repeat(1, 1, self.num_signal_heads//self.num_noise_heads, 1) # (L, B, H_signal_local, D)
+                    else:
+                        core_attn_out_2 = core_attn_out_2.repeat(1, self.num_signal_heads//self.num_noise_heads, 1)
             else:
                 # Dynamic batching attention kernel.
                 cu_query_lengths, max_seqlen_q = inference_context.cu_query_lengths()
@@ -1014,8 +1077,10 @@ class DiffAttention(MegatronModule, ABC):
             # (t, np, hn) -> (t, b=1, h=np*hn)
             # t is the pack size = sum (sq_i)
             # note that batch is a dummy dimension in the packed case
-            core_attn_out = core_attn_out.reshape(core_attn_out.size(0), 1, -1)
+            core_attn_out = core_attn_out.unsqueeze(1)
         nvtx_range_pop(suffix="core_attention")
+
+        return core_attn_out
 
         # Output gate
         if gate is not None:
@@ -1024,6 +1089,29 @@ class DiffAttention(MegatronModule, ABC):
             nvtx_range_pop(suffix="output_gate")
 
         return core_attn_out
+
+    #@torch.compile # TODO: reactive. it's disabled during tests
+    def _torch_compiled_token_shift(self, key, value, alpha_k, alpha_v, position_ids=None):
+        alpha_k = torch.sigmoid(alpha_k.float()).float().to(key.dtype) # (L, B, H_local, 1)
+        alpha_v = torch.sigmoid(alpha_v.float()).float().to(value.dtype) # (L, B, H_noise_local, 1)
+        if position_ids is not None:
+            # first token of each doc has pos==0
+            doc_start = (position_ids == 0).view(-1, 1, 1, 1) # (L, 1, 1, 1) bool
+        else:
+            L, B = key.shape[:2]
+            doc_start = torch.zeros(L, 1, 1, 1, dtype=torch.bool, device=key.device)
+            doc_start[0] = True
+
+        alpha_k = alpha_k.masked_fill(doc_start, 0)
+        alpha_v = alpha_v.masked_fill(doc_start, 0)
+
+        key_prev = torch.nn.functional.pad(key, (0, 0, 0, 0, 0, 0, 1, 0))[:-1] # (L, B, H_local, D)
+        value_prev = torch.nn.functional.pad(value, (0, 0, 0, 0, 0, 0, 1, 0))[:-1] # (L,B, H_noise_local, D)
+
+        key = alpha_k * key_prev + (1 - alpha_k) * key
+        value = alpha_v * value_prev + (1 - alpha_v) * value
+
+        return key, value
 
     @torch.compile
     def _torch_compiled_output_gate(self, x, gate):
@@ -1037,7 +1125,6 @@ class DiffAttention(MegatronModule, ABC):
     def set_for_recompute_input_layernorm(self):
         """Set the attention layer for recompute input_layernorm. Only needed for fp8."""
         raise NotImplementedError("set_for_recompute_input_layernorm is not implemented.")
-
 
 class SelfDiffAttention(DiffAttention):
     """Self-attention layer class
@@ -1065,39 +1152,44 @@ class SelfDiffAttention(DiffAttention):
             pg_collection=pg_collection,
         )
 
-        self.linear_qkag_out_dim = self.query_projection_size + self.kv_projection_size
-        if self.config.token_shift:
-            self.linear_qkag_out_dim += + self.num_attention_heads
-        if self.config.gate_attn:
-            self.linear_qkag_out_dim += self.config.kv_channels * self.num_attention_heads
-        self.linear_qkag = build_module(
-            submodules.linear_qkag,
+        Dk = self.config.kv_channels
+        r = self.config.tpa_rank
+        alpha_dim = 1 if self.config.token_shift else 0
+        gate_dim = Dk if self.config.gate_attn else 0
+
+        # we make groups of 4 heads (q, A_k, alpha_k), 1 noise head (A_v, alpha_v), and 3 signal heads (gate).
+        # we call each group a "super head".
+        self.num_super_heads = self.config.num_attention_heads // 4
+        self.num_super_heads_per_partition = self.num_super_heads // self.pg_collection.tp.size()
+        self.super_head_dim = 4 * (Dk + r + alpha_dim) + 1 * (r + alpha_dim) + 3 * (gate_dim)
+        out_dim = self.num_super_heads * self.super_head_dim
+        self.linear_in = build_module(
+            submodules.linear_in,
             self.config.hidden_size,
-            self.linear_qkag_out_dim,
+            out_dim,
             config=self.config,
             init_method=self.config.init_method,
             gather_output=False,
             bias=self.config.add_bias_linear or self.config.add_qkv_bias,
             skip_bias_add=False,
             is_expert=False,
-            tp_comm_buffer_name='qkag',
+            tp_comm_buffer_name='in',
             tp_group=self.pg_collection.tp,
-        )
-        self.linear_va_out_dim = self.num_noise_heads * self.config.kv_channels
-        if self.config.token_shift:
-            self.linear_va_out_dim += self.num_noise_heads
-        self.linear_va = build_module(
-            submodules.linear_va,
+        ) 
+
+        out_dim = 2 * r * Dk
+        self.linear_BkBv = build_module(
+            submodules.linear_BkBv,
             self.config.hidden_size,
-            self.linear_va_out_dim,
+            out_dim,
             config=self.config,
             init_method=self.config.init_method,
-            gather_output=False,
-            bias=self.config.add_bias_linear or self.config.add_qkv_bias,
+            bias=self.config.add_bias_linear,
             skip_bias_add=False,
+            skip_weight_param_allocation=False,
+            parallel_mode='duplicated', # duplicated across ranks. TODO: train and check that they are synced across ranks.
             is_expert=False,
-            tp_comm_buffer_name='va',
-            tp_group=self.pg_collection.tp,
+            tp_comm_buffer_name='BkBv',
         )
 
         if submodules.q_layernorm is not None:
@@ -1192,55 +1284,80 @@ class SelfDiffAttention(DiffAttention):
             )
 
     def get_query_key_value_tensors(self, hidden_states):
-        # project to q, k, (alpha_k), (gate)
-        mixed_qkag, _ = self.linear_qkag(hidden_states) # [L, B, H_local * D]
-        mixed_qkag = rearrange(mixed_qkag, "l b (h p) -> l b h p", h=self.num_attention_heads_per_partition)#.contiguous()
-        # split per head: [L, B, H_local, dq/dk/(1)/(do)] where dq=dk=do
-        q = mixed_qkag[..., 0:self.key_hidden_size]; accum = self.key_hidden_size
-        k = mixed_qkag[..., accum:accum+self.key_hidden_size]; accum += self.key_hidden_size
-        alpha_k = None
-        gate = None
-        if self.config.token_shift:
-            alpha_k = mixed_qkag[..., accum:accum+1]; accum += 1
-        if self.config.gate_attn:
-            gate = mixed_qkag[..., accum:]
-        
-        # project to v, (alpha_v)
-        mixed_va, _ = self.linear_va(hidden_states) # [L, B, H_noise_local * D]
-        mixed_va = rearrange(mixed_va, "l b (h p) -> l b h p", h=self.num_noise_heads_per_partition)#.contiguous()
-        # split per head: [L, B, H_noise_local, dv/(1)] where dq=dv
-        v = mixed_va[..., 0:self.val_hidden_size]; accum = self.val_hidden_size
-        alpha_v = None
-        if self.config.token_shift:
-            alpha_v = mixed_va[..., accum:]
+        Dk = self.config.kv_channels
+        r = self.config.tpa_rank
+        alpha_dim = 1 if self.config.token_shift else 0
+        gate_dim = Dk if self.config.gate_attn else 0
 
+        mixed_in, _ = self.linear_in(hidden_states) # [L, B, super_head_dim * num_super_heads]
+        mixed_in = rearrange(mixed_in, "l b (H p) -> l b H p", H=self.num_super_heads_per_partition)#.contiguous()
+        # split per super head: [L, B, H_super_local, super_head_dim]
+        mixed_heads = mixed_in[..., 0:4*(Dk + r + alpha_dim)]; accum = 4*(Dk + r + alpha_dim)
+        mixed_noise_heads = mixed_in[..., accum:accum + 1*(r + alpha_dim)]; accum += 1*(r + alpha_dim)
+        mixed_signal_heads = mixed_in[..., accum:accum+3*Dk]
+
+        # mixed_heads: [L, B, H_super_local, 4*(Dk + r + alpha_dim)]
+        # mixed_noise_heads: [L, B, H_super_local, 1*(r + alpha_dim)]
+        # mixed_signal_heads: [L, B, H_super_local, 3*Dk]
+
+        # split mixed_heads into q, A_k, (alpha_k)
+        mixed_heads = rearrange(mixed_heads, "l b h (n d) -> l b (h n) d", n=4) # [L, B, H_local, D]
+        q = mixed_heads[..., 0:Dk]; accum = Dk
+        A_k = mixed_heads[..., accum:accum+r]; accum += r
+        alpha_k = mixed_heads[..., accum:accum+alpha_dim] if self.config.token_shift else None
+        # split mixed_noise_heads into A_v, (alpha_v)
+        mixed_noise_heads = rearrange(mixed_noise_heads, "l b h (n d) -> l b (h n) d", n=1) # [L, B, H_noise_local, D]
+        A_v = mixed_noise_heads[..., 0:r]; accum = r
+        alpha_v = mixed_noise_heads[..., accum:] if self.config.token_shift else None
+        # split mixed_signal_heads into gate
+        mixed_signal_heads = rearrange(mixed_signal_heads, "l b h (n d) -> l b (h n) d", n=3) # [L, B, H_signal_local, D]
+        gate = mixed_signal_heads[..., 0:gate_dim] if self.config.gate_attn else None
+
+        # project to B_k, B_v (shared across TP ranks)
+        mixed_BkBv, _ = self.linear_BkBv(hidden_states) # [L, B, 2*r*Dk]
+        B_k, B_v = torch.split(mixed_BkBv, r * Dk, dim=-1) # [L, B, r*Dk], [L, B, r*Dk]
+
+        # q: [L, B, H_local, dk], A_k: [L, B, H_local, r], alpha_k: [L, B, H_local, 1]
+        # A_v: [L, B, H_noise_local, r], alpha_v: [L, B, H_noise_local, 1]
+        # gate: [L, B, H_signal_local, Dk]
+        # B_k: [L, B, r*Dk], B_v: [L, B, r*Dk]
+
+        if self.config.test_mode:
+            self.run_realtime_tests()
+
+        return q, A_k, A_v, B_k, B_v, alpha_k, alpha_v, gate
+
+    def get_gate_tensor(self, hidden_states):
+        Dk = self.config.kv_channels
+        mixed_g, _ = self.linear_g(hidden_states) # [L, B, H_signal_local * Dk]
+        mixed_g = rearrange(mixed_g, "l b (h d) -> l b h d", h=self.num_signal_heads_per_partition)#.contiguous()
+        # split per head: [L, B, H_signal_local, Dk]
+        g = mixed_g[..., 0:Dk]
+        return g
+
+    def normalize_qk(self, q, k):
         if self.q_layernorm is not None:
             q = self.q_layernorm(q)
 
         if self.k_layernorm is not None:
             k = self.k_layernorm(k)
-
-        if self.config.test_mode:
-            self.run_realtime_tests()
-
-        return q, k, v, alpha_k, alpha_v, gate
+        return q, k
 
     def backward_dw(self) -> NoReturn:
         """Execute weight update operations"""
-        self._backward_qkag_proj()
-        self._backward_va_proj()
+        self._backward_proj()
+        self._backward_BkBv()
 
-    def _backward_qkag_proj(self):
+    def _backward_proj(self):
         """Update weights for QKV projection layer"""
-        self.linear_qkag.backward_dw()
-
-    def _backward_va_proj(self):
-        """Update weights for QKV projection layer"""
-        self.linear_va.backward_dw()
+        self.linear_in.backward_dw()
+    
+    def _backward_BkBv(self):
+        """Update weights for BkBv projection layer"""
+        self.linear_BkBv.backward_dw()
 
     def set_for_recompute_input_layernorm(self):
         """Set the attention layer for recompute input_layernorm. Only needed for fp8."""
         from megatron.core.extensions.transformer_engine import set_save_original_input
 
-        set_save_original_input(self.linear_qkag)
-        set_save_original_input(self.linear_va)
+        set_save_original_input(self.linear_in)

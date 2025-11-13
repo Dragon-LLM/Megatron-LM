@@ -12,6 +12,7 @@ class PackedSeqParams:
     '''
 
     qkv_format: str = None
+    position_ids: Tensor = None
     cu_seqlens_q: Tensor = None
     cu_seqlens_kv: Tensor = None
     cu_seqlens_q_padded: Tensor = None

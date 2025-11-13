@@ -108,6 +108,8 @@ class DragonConfig(ModelParallelConfig):
 
     num_signal_heads: int = 0
 
+    tpa_rank: int = 4
+
     token_shift: bool = True
 
     gate_attn: bool = True
@@ -694,6 +696,12 @@ class DragonConfig(ModelParallelConfig):
     ####################
     # miscellaneous
     ####################
+    intra_doc_masking: bool = False
+    """If true, use intra-document masking during pretraining. (this flag is just used for allocating parameters correctly)"""
+
+    training_sequence_length: int = 8192
+    """Sequence length used during training. Used for allocating buffers."""
+
     clone_scatter_output_in_embedding: bool = True
     """When set to True, clone the output of scatter_to_sequence_parallel_region in embedding layer
     to facilitate garbage collection of input."""
@@ -1419,32 +1427,9 @@ class DragonConfig(ModelParallelConfig):
         if self.multi_latent_attention and self.rotary_interleaved:
             raise ValueError("rotary_interleaved does not work with multi_latent_attention.")
 
-        # Set the embedding init method
-        if self.embedding_init_method_std is None:
-            # By default, use the same init std as you use for every other non-output layer.
-            self.embedding_init_method_std = self.init_method_std
-
-        if self.embedding_init_method is None:
-            if self.init_method is None or (self.embedding_init_method_std != self.init_method_std):
-                # In this case, we set both the init method and the embedding init method to
-                #  whatever std value requested (or defaulted) for the embedding_init_layer
-                self.embedding_init_method = init_method_normal(self.embedding_init_method_std)
-            else:
-                # Replicate the current behavior where if you are not changing the std of the
-                #  embedding init differently and the init method is set, we fallback to the
-                #  init method for this layer. Since we are here after an OR we know that
-                #  init_method is not None
-                self.embedding_init_method = self.init_method
-
-        if self.init_method is None:
-            self.init_method = init_method_normal(self.init_method_std)
-
-        if self.output_layer_init_method is None:
-            self.output_layer_init_method = scaled_init_method_normal(
-                self.init_method_std,
-                self.num_layers,
-                multiplier=2.0 if not self.is_hybrid_model else 1.0,
-            )
+        self.embedding_init_method = init_method_normal(self.init_embedding_std)
+        self.init_method = init_method_normal(self.init_std)
+        self.output_layer_init_method = init_method_normal(self.init_output_std)
 
         if self.num_moe_experts is not None and self.add_bias_linear:
             assert (
