@@ -53,6 +53,7 @@ from megatron.core.utils import (
     is_te_min_version,
     is_torch_min_version,
 )
+from megatron.core.activations import squared_relu
 
 try:
     import transformer_engine as te
@@ -187,9 +188,11 @@ if HAVE_TE and is_te_min_version("1.13.0"):
                     layer_type = te.pytorch.ops.GELU
                 elif config.activation_func == F.silu:
                     layer_type = te.pytorch.ops.ReLU
+                elif config.activation_func == squared_relu:
+                    layer_type = te.pytorch.ops.SReLU
             if layer_type is None:
                 raise Exception(
-                    'Only SwiGLU, GEGLU, ReGLU, GELU, ReLU are supported by '
+                    'Only SwiGLU, GEGLU, ReGLU, GELU, ReLU, SReLU are supported by '
                     'transformer engine. Please set use_te_activation_func=False'
                 )
             activation_func_kwargs = {}

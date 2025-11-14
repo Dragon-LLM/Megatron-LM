@@ -308,7 +308,7 @@ class MoELayer(BaseMoELayer):
             dispatched_input, probs = self.dispatch(hidden_states, probs)
             output, mlp_bias = self.routed_experts_compute(dispatched_input, probs, residual)
             output = self.combine(output, shared_expert_output)
-            return output, mlp_bias
+            return output, mlp_bias, routing_map # TODO: routing_map added for debugging
 
         if self.moe_layer_recompute:
             if self.config.fp8:
