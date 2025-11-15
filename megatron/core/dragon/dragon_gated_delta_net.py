@@ -281,7 +281,7 @@ class GatedDeltaNet(MegatronModule):
         nvtx_range_push(suffix="in_proj")
         qkvzba, _ = self.in_proj(hidden_states)
         nvtx_range_pop(suffix="in_proj")
-        qkvzba = qkvzba.transpose(0, 1)
+        qkvzba = qkvzba.transpose(0, 1) # s b x --> b s x
         qkvzba = rearrange(qkvzba, "b l (h p) -> b l h p", h=self.num_heads_local)#.contiguous()
         # split per head: [L, B, H_local, dk+dk+dv/dv/1/1] where dq=dk=do
         qkv = qkvzba[..., :2*self.key_head_dim+self.value_head_dim]; accum = 2*self.key_head_dim+self.value_head_dim
