@@ -234,11 +234,6 @@ class DiffAttention(MegatronModule, ABC):
             and "core_attn" in self.config.offload_modules
         )
 
-        self.offload_attn_proj = (
-            self.config.fine_grained_activation_offloading
-            and "attn_proj" in self.config.offload_modules
-        )
-
         self.wsize_prev = None
 
         self.register_buffer("inv_rank", torch.tensor(1./self.config.tpa_rank), persistent=False)
@@ -812,7 +807,7 @@ class DiffAttention(MegatronModule, ABC):
             key, value = self._torch_compiled_token_shift(key, value, alpha_k, alpha_v, position_ids=packed_seq_params.position_ids if packed_seq_params is not None else None)
 
         # =====================
-        # QK-norm
+        # QK norm
         # =====================
         query, key = self.normalize_qk(query, key)
 
@@ -1080,8 +1075,6 @@ class DiffAttention(MegatronModule, ABC):
             core_attn_out = core_attn_out.unsqueeze(1)
         nvtx_range_pop(suffix="core_attention")
 
-        return core_attn_out
-
         # Output gate
         if gate is not None:
             nvtx_range_push(suffix="output_gate")
@@ -1113,12 +1106,11 @@ class DiffAttention(MegatronModule, ABC):
 
         return key, value
 
-    @torch.compile
+    #@torch.compile # TODO: reactive. it's disabled during tests
     def _torch_compiled_output_gate(self, x, gate):
-        # TODO: ZCG4
         x_dtype = x.dtype
         gate = gate.contiguous().view(*x.shape)
-        x = x * torch.silu(gate.float())
+        x = x * torch.nn.functional.silu(gate.float() + 1.15)
         x = x.to(x_dtype)
         return x
 
@@ -1171,11 +1163,12 @@ class SelfDiffAttention(DiffAttention):
             init_method=self.config.init_method,
             gather_output=False,
             bias=self.config.add_bias_linear or self.config.add_qkv_bias,
+            return_layernorm_output=True,
             skip_bias_add=False,
             is_expert=False,
             tp_comm_buffer_name='in',
             tp_group=self.pg_collection.tp,
-        ) 
+        )
 
         out_dim = 2 * r * Dk
         self.linear_BkBv = build_module(
@@ -1289,7 +1282,8 @@ class SelfDiffAttention(DiffAttention):
         alpha_dim = 1 if self.config.token_shift else 0
         gate_dim = Dk if self.config.gate_attn else 0
 
-        mixed_in, _ = self.linear_in(hidden_states) # [L, B, super_head_dim * num_super_heads]
+        out, _ = self.linear_in(hidden_states) # [L, B, super_head_dim * num_super_heads]
+        mixed_in, normed_hidden_states = out
         mixed_in = rearrange(mixed_in, "l b (H p) -> l b H p", H=self.num_super_heads_per_partition)#.contiguous()
         # split per super head: [L, B, H_super_local, super_head_dim]
         mixed_heads = mixed_in[..., 0:4*(Dk + r + alpha_dim)]; accum = 4*(Dk + r + alpha_dim)
@@ -1314,7 +1308,7 @@ class SelfDiffAttention(DiffAttention):
         gate = mixed_signal_heads[..., 0:gate_dim] if self.config.gate_attn else None
 
         # project to B_k, B_v (shared across TP ranks)
-        mixed_BkBv, _ = self.linear_BkBv(hidden_states) # [L, B, 2*r*Dk]
+        mixed_BkBv, _ = self.linear_BkBv(normed_hidden_states) # [L, B, 2*r*Dk]
         B_k, B_v = torch.split(mixed_BkBv, r * Dk, dim=-1) # [L, B, r*Dk], [L, B, r*Dk]
 
         # q: [L, B, H_local, dk], A_k: [L, B, H_local, r], alpha_k: [L, B, H_local, 1]

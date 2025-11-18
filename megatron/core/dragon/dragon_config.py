@@ -689,8 +689,8 @@ class DragonConfig(ModelParallelConfig):
 
     cuda_graph_scope: Optional[List[str]] = None
     """Determines the CUDA graphs capturing scope.
-    When cuda_graph_impl is set to "transformer_engine", valid values are "attn", "mlp", "moe",
-    "moe_router", "moe_preprocess", "mamba". None means ["attn", "mlp"].
+    When cuda_graph_impl is set to "transformer_engine", valid values are "mixer", "mlp", "moe",
+    "moe_router", "moe_preprocess", "mamba". None means ["mixer", "mlp"].
     When cuda_graph_impl is set to "local", "full_iteration" can be specified as cuda_graph_scope
     to enable whole iteration CUDA graph. All other values enable layerwise CUDA graph."""
 
@@ -784,12 +784,12 @@ class DragonConfig(ModelParallelConfig):
 
     offload_modules: Optional[list[str]] = None
     """The submodules to offload its input.
-    choices: "attn_norm", "qkv_linear", "core_attn", "attn_proj",
+    choices: "attn_norm", "qkv_linear", "core_attn", "mixer_proj",
              "mlp_norm", "expert_fc1", "moe_act".
     "attn_norm": offload the input of the normalization in the attention part.
     "qkv_linear": offload the input of the qkv linear part.
     "core_attn": offload the input of the core attention part.
-    "attn_proj": offload the input of the attn linear projection part.
+    "mixer_proj": offload the input of the mixer linear projection part.
     "mlp_norm": offload the input of the normalization in the mlp part.
     "expert_fc1": offload the input of the expert fc1 part.
     "moe_act": offload the input of the moe act part.

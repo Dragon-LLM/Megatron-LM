@@ -1,7 +1,7 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 """Megatron Module."""
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Union
 
 import torch
 from torch.autograd import Variable
@@ -10,6 +10,7 @@ from torch.nn.parameter import Parameter
 from megatron.core import parallel_state
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.megatron.core.dragon.dragon_config import DragonConfig
 from megatron.core.transformer.utils import (
     make_sharded_tensors_for_checkpoint,
     sharded_state_dict_default,
@@ -147,10 +148,10 @@ class GraphableMegatronModule(MegatronModule):
         config (TransformerConfig): Transformer config
     """
 
-    def __init__(self, config: TransformerConfig, vp_stage: Optional[int] = None):
+    def __init__(self, config: Union[TransformerConfig, DragonConfig], vp_stage: Optional[int] = None):
         super().__init__(config)
 
-        assert isinstance(config, TransformerConfig), "config must be a TransformerConfig"
+        assert isinstance(config, (TransformerConfig, DragonConfig)), "config must be a TransformerConfig"
 
         # Enable cuda graphs.
         if config.cuda_graph_impl == "local":

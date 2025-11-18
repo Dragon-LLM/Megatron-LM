@@ -210,7 +210,7 @@ class TENorm:
     Transformer-Engine's `LayerNorm` or `RMSNorm` based on input."""
 
     # TODO should we ditch normalization config and just use spec to choose LayerNorm vs RMSNorm?
-    def __new__(cls, config: TransformerConfig, hidden_size: int, eps: float = 1e-5):
+    def __new__(cls, config: TransformerConfig, hidden_size: int, eps: float = 1e-5, use_weights: bool = True):
         if not HAVE_TE:
             raise ImportError(
                 "Transformer Engine is not installed. "
@@ -223,6 +223,7 @@ class TENorm:
                 eps=eps,
                 sequence_parallel=config.sequence_parallel,
                 zero_centered_gamma=config.layernorm_zero_centered_gamma,
+                use_weights=use_weights,
                 **_get_extra_te_kwargs(config),
             )
         elif config.normalization == "RMSNorm":
@@ -234,6 +235,7 @@ class TENorm:
                 eps=eps,
                 sequence_parallel=config.sequence_parallel,
                 zero_centered_gamma=config.layernorm_zero_centered_gamma,
+                use_weights=use_weights,
                 **_get_extra_te_kwargs(config),
             )
         else:
@@ -470,6 +472,7 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
         bias: bool,
         skip_bias_add: bool,
         is_expert: bool,
+        return_layernorm_output: bool = False,
         skip_weight_param_allocation: bool = False,
         tp_comm_buffer_name: Optional[str] = None,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
@@ -582,7 +585,7 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
             bias=bias,
             return_bias=self.te_return_bias,
             parallel_mode="column",
-            return_layernorm_output=False,
+            return_layernorm_output=return_layernorm_output,
             zero_centered_gamma=self.config.layernorm_zero_centered_gamma,
             **extra_kwargs,
         )

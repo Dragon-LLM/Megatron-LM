@@ -234,6 +234,7 @@ class GatedDeltaNet(MegatronModule):
         rotary_pos_sin: Optional[Tensor] = None,
         rotary_pos_cos_sin: Optional[Tensor] = None,
         attention_bias: Optional[Tensor] = None,
+        window_size: Optional[Tuple[int, int]] = None, # not used, for compatibility
         packed_seq_params: Optional[PackedSeqParams] = None,
         sequence_len_offset: Optional[int] = None,
         *,
@@ -361,10 +362,9 @@ class GatedDeltaNet(MegatronModule):
 
     @torch.compile
     def _torch_compiled_output_gate(self, x, gate):
-        # TODO: ZCG4
         x_dtype = x.dtype
         gate = gate.contiguous().view(*x.shape)
-        x = x * F.silu(gate.float())
+        x = x * F.silu(gate.float() + 1.15)
         x = x.to(x_dtype)
         return x
     
