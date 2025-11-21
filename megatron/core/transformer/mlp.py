@@ -5,6 +5,7 @@ import warnings
 from dataclasses import dataclass
 from typing import Optional, Union
 
+import math
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -135,6 +136,7 @@ class MLP(MegatronModule):
             is_expert=is_expert,
             tp_comm_buffer_name="fc2",
             tp_group=tp_group,
+            alpha=2/math.sqrt(5) if hasattr(self.config, 'use_uscaling') and self.config.use_uscaling else None,
         )
 
     def forward(self, hidden_states, per_token_scale=None):

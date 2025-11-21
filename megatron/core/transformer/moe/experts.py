@@ -5,6 +5,7 @@ import itertools
 from copy import deepcopy
 from functools import partial, wraps
 from math import ceil
+import math
 from typing import Optional, Tuple
 
 import torch
@@ -828,6 +829,7 @@ class TEGroupedMLP(MegatronModule):
             is_expert=True,
             tp_comm_buffer_name='fc2',
             tp_group=pg_collection.expt_tp,
+            alpha=2/math.sqrt(5) if hasattr(self.config, 'use_uscaling') and self.config.use_uscaling else None,
         )
 
         self.offload_expert_fc1 = (

@@ -2,7 +2,7 @@
 import logging
 from contextlib import nullcontext
 from dataclasses import dataclass
-from typing import List, Optional, Union
+from typing import List, Optional, Union, Tuple
 
 import torch
 from torch import Tensor
@@ -24,10 +24,10 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.enums import LayerType
 from megatron.core.transformer.module import GraphableMegatronModule, MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
-from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.transformer.transformer_layer import (
-    BaseTransformerLayer,
-    get_transformer_layer_offset,
+from megatron.core.dragon.dragon_config import DragonConfig
+from megatron.core.dragon.dragon_layer import (
+    BaseDragonLayer,
+    get_dragon_layer_offset,
 )
 from megatron.core.transformer.utils import sharded_state_dict_default
 from megatron.core.utils import (
@@ -76,12 +76,12 @@ logger = logging.getLogger(__name__)
 
 
 def get_num_layers_to_build(
-    config: TransformerConfig, vp_stage: Optional[int] = None, pp_rank: Optional[int] = None
+    config: DragonConfig, vp_stage: Optional[int] = None, pp_rank: Optional[int] = None
 ) -> int:
     """
-    Determine the number of transformer layers to build for the current pipeline stage.
+    Determine the number of Dragon layers to build for the current pipeline stage.
     Args:
-        config (TransformerConfig): Configuration object containing transformer model parameters.
+        config (DragonConfig): Configuration object containing Dragon model parameters.
         vp_stage (Optional[int]): Virtual pipeline stage number.
         pp_rank (Optional[int]): Pipeline parallel rank.
 
@@ -206,38 +206,38 @@ def get_num_layers_to_build(
 
 
 @dataclass
-class TransformerBlockSubmodules:
+class DragonBlockSubmodules:
     """
-    Dataclass for specifying the submodules of a transformer block.
+    Dataclass for specifying the submodules of a Dragon block.
 
     This class defines the structure for configuring the layers and normalization
-    within a transformer block, allowing for flexible and customizable architecture designs.
+    within a Dragon block, allowing for flexible and customizable architecture designs.
 
     Args:
         layer_specs (List[ModuleSpec], optional): A list of module specifications for
-            the layers within the transformer block. Each specification typically
-            defines a complete transformer layer (e.g., self-attention, feed-forward network).
+            the layers within the Dragon block. Each specification typically
+            defines a complete Dragon layer (e.g., self-attention, feed-forward network).
         layer_norm (Optional[Union[ModuleSpec, torch.nn.Module]], optional): Specification
             or instance of the layer normalization to be applied.
     """
 
     layer_specs: List[ModuleSpec] = None
-    layer_norm: Optional[Union[ModuleSpec, torch.nn.Module]] = None
+    final_layer_norm: Optional[Union[ModuleSpec, torch.nn.Module]] = None
 
 
 def _get_block_submodules(
-    config: TransformerConfig,
-    spec: Union[TransformerBlockSubmodules, ModuleSpec],
+    config: DragonConfig,
+    spec: Union[DragonBlockSubmodules, ModuleSpec],
     vp_stage: Optional[int] = None,
     pp_rank: Optional[int] = None,
-) -> TransformerBlockSubmodules:
+) -> DragonBlockSubmodules:
     """
-    Retrieve or construct TransformerBlockSubmodules based on the provided specification.
+    Retrieve or construct DragonBlockSubmodules based on the provided specification.
 
     Args:
-        config (TransformerConfig): Configuration object for the transformer model.
-        spec (Union[TransformerBlockSubmodules, ModuleSpec]): Specification for the
-            transformer block submodules. Can be either a TransformerBlockSubmodules
+        config (DragonConfig): Configuration object for the Dragon model.
+        spec (Union[DragonBlockSubmodules, ModuleSpec]): Specification for the
+            Dragon block submodules. Can be either a DragonBlockSubmodules
             instance or a ModuleSpec.
         vp_stage (Optional[int]): Virtual pipeline stage number.
 
@@ -245,19 +245,19 @@ def _get_block_submodules(
         TransformerBlockSubmodules: The submodules for the transformer block.
     """
 
-    # Transformer block submodules.
-    if isinstance(spec, TransformerBlockSubmodules):
+    # Dragon block submodules.
+    if isinstance(spec, DragonBlockSubmodules):
         return spec
 
     # ModuleSpec here is generally assumed to be for a transformer layer that
     # is implemented in `transformer_layer.py` or if it subclasses
     # `BaseTransformerLayer` from the `transformer_layer.py` file.
     elif isinstance(spec, ModuleSpec):
-        if issubclass(spec.module, TransformerBlock):
+        if issubclass(spec.module, DragonBlock):
             return spec.submodules
-        elif issubclass(spec.module, BaseTransformerLayer):
+        elif issubclass(spec.module, BaseDragonLayer):
             num_layers = get_num_layers_to_build(config, vp_stage, pp_rank)
-            return TransformerBlockSubmodules(
+            return DragonBlockSubmodules(
                 layer_specs=[spec] * num_layers, layer_norm=LayerNormImpl
             )
         else:
@@ -266,13 +266,13 @@ def _get_block_submodules(
         raise Exception(f"specialize for {type(spec).__name__}.")
 
 
-class TransformerBlock(GraphableMegatronModule, MegatronModule):
-    """Transformer class."""
+class DragonBlock(GraphableMegatronModule, MegatronModule):
+    """Dragon class."""
 
     def __init__(
         self,
-        config: TransformerConfig,
-        spec: Union[TransformerBlockSubmodules, ModuleSpec],
+        config: DragonConfig,
+        spec: Union[DragonBlockSubmodules, ModuleSpec],
         post_layer_norm: bool = True,
         pre_process: bool = True,
         post_process: bool = True,
@@ -328,14 +328,14 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         self.num_layers_per_pipeline_rank = len(self.layers)
 
     def _build_layers(self):
-        # Transformer layers.
+        # Dragon layers.
         # @jcasper can we improve how we deal with layer_number?
         # currently it's only used in CoreAttention?
         # if self.apply_query_key_layer_scaling:
         #     coeff = self.layer_number
         #     self.norm_factor *= coeff
-        def build_layer(layer_spec, layer_number):
-            global_layer_number = layer_number + get_transformer_layer_offset(
+        def build_layer(layer_spec, layer_number, layer_type):
+            global_layer_number = layer_number + get_dragon_layer_offset(
                 self.config, self.vp_stage, get_pg_rank(self.pg_collection.pp)
             )  # 1-based index
             if self.config.heterogeneous_block_specs:
@@ -359,6 +359,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                 module = build_module(
                     layer_spec,
                     config=layer_config,
+                    layer_type=layer_type,
                     layer_number=layer_number,
                     pg_collection=self.pg_collection,
                     vp_stage=self.vp_stage,
@@ -368,7 +369,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         # offset is implicit in TransformerLayer
         self.layers = torch.nn.ModuleList(
             [
-                build_layer(layer_spec, i + 1)
+                build_layer(layer_spec, i + 1, self.config.layers_config[i])
                 for i, layer_spec in enumerate(self.submodules.layer_specs)
             ]
         )
@@ -378,7 +379,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         # self.post_process and self.post_layer_norm guide this behavior
         if self.has_final_layernorm_in_this_stage():
             self.final_layernorm = build_module(
-                self.submodules.layer_norm,
+                self.submodules.final_layer_norm,
                 config=self.config,
                 hidden_size=self.config.hidden_size,
                 eps=self.config.layernorm_epsilon,
@@ -400,7 +401,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         if self.config.mtp_num_layers is None:
             # for model without MTPLayer, the final layernorm is set in the stage which does
             # post_process
-            return self.submodules.layer_norm and self.post_process and self.post_layer_norm
+            return self.submodules.final_layer_norm and self.post_process and self.post_layer_norm
         else:
             # for model with MTPLayer, the final layernorm is set in the stage which has the
             # last layer of the decoder
@@ -410,7 +411,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                     has_final_layernorm_in_this_stage = True
                     break
             return (
-                self.submodules.layer_norm
+                self.submodules.final_layer_norm
                 and has_final_layernorm_in_this_stage
                 and self.post_layer_norm
             )
@@ -422,8 +423,6 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         self,
         hidden_states: Tensor,
         attention_mask: Tensor,
-        context: Tensor,
-        context_mask: Tensor,
         rotary_pos_emb: Tensor,
         attention_bias: Tensor,
         packed_seq_params: PackedSeqParams,
@@ -433,7 +432,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
 
         def custom(start: int, end: int):
             def custom_forward(
-                hidden_states, attention_mask, context, context_mask, rotary_pos_emb
+                hidden_states, attention_mask, rotary_pos_emb
             ):
                 for index in range(start, end):
                     layer = self._get_layer(index)
@@ -455,17 +454,15 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                         inner_quantization_context = nullcontext()
 
                     with inner_quantization_context:
-                        hidden_states, context = layer(
+                        hidden_states = layer(
                             hidden_states=hidden_states,
                             attention_mask=attention_mask,
-                            context=context,
-                            context_mask=context_mask,
                             rotary_pos_emb=rotary_pos_emb,
                             attention_bias=attention_bias,
                             inference_context=None,
                             packed_seq_params=packed_seq_params,
                         )
-                return hidden_states, context
+                return hidden_states
 
             return custom_forward
 
@@ -480,8 +477,6 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                     self.pg_collection.tp,
                     hidden_states,
                     attention_mask,
-                    context,
-                    context_mask,
                     rotary_pos_emb,
                 )
             else:
@@ -490,8 +485,6 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                     self.config.distribute_saved_activations,
                     hidden_states,
                     attention_mask,
-                    context,
-                    context_mask,
                     rotary_pos_emb,
                 )
 
@@ -588,13 +581,12 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         self,
         hidden_states: Union[Tensor, WrappedTensor],
         attention_mask: Optional[Tensor],
-        context: Optional[Tensor] = None,
-        context_mask: Optional[Tensor] = None,
         rotary_pos_emb: Optional[Tensor] = None,
         rotary_pos_cos: Optional[Tensor] = None,
         rotary_pos_sin: Optional[Tensor] = None,
         rotary_pos_cos_sin: Optional[Tensor] = None,
         attention_bias: Optional[Tensor] = None,
+        window_size: Optional[Tuple[int, int]] = None,
         inference_context: Optional[BaseInferenceContext] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
         sequence_len_offset: Optional[Tensor] = None,
@@ -615,8 +607,6 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                 reference in the calling function.
             attention_mask (Tensor): Boolean tensor of shape [1, 1, s, s] for masking
                 self-attention.
-            context (Tensor, optional): Context tensor for cross-attention.
-            context_mask (Tensor, optional): Mask for cross-attention context
             rotary_pos_emb (Tensor, optional): Rotary positional embeddings.
             rotary_pos_cos (Optional[Tensor]): Rotary embedding cosine.
             rotary_pos_sin (Optional[Tensor]): Rotary embedding sine.
@@ -701,10 +691,9 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                 hidden_states = self._checkpointed_forward(
                     hidden_states=hidden_states,
                     attention_mask=attention_mask,
-                    context=context,
-                    context_mask=context_mask,
                     rotary_pos_emb=rotary_pos_emb,
                     attention_bias=attention_bias,
+                    window_size=window_size,
                     packed_seq_params=packed_seq_params,
                     use_inner_quantization_context=use_inner_quantization_context,
                 )
@@ -731,20 +720,22 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                         )
 
                     with self.offload_context, inner_quantization_context:
-                        hidden_states, context = layer(
+                        hidden_states = layer(
                             hidden_states=hidden_states,
                             attention_mask=attention_mask,
-                            context=context,
-                            context_mask=context_mask,
                             rotary_pos_emb=rotary_pos_emb,
                             rotary_pos_cos=rotary_pos_cos,
                             rotary_pos_sin=rotary_pos_sin,
                             rotary_pos_cos_sin=rotary_pos_cos_sin,
                             attention_bias=attention_bias,
+                            window_size=window_size,
                             inference_context=inference_context,
                             packed_seq_params=packed_seq_params,
                             sequence_len_offset=sequence_len_offset,
                         )
+
+                    """if l_no == 0:
+                        return hidden_states"""
 
                     if (
                         torch.is_grad_enabled()
@@ -819,7 +810,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         layer_prefix = f'{prefix}layers.'
         num_layers = self.config.num_layers
         for layer in self.layers:
-            offset = get_transformer_layer_offset(
+            offset = get_dragon_layer_offset(
                 self.config, self.vp_stage, get_pg_rank(self.pg_collection.pp)
             )
 

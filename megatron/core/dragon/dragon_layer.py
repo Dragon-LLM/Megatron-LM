@@ -420,13 +420,8 @@ class DragonLayer(GraphableMegatronModule, BaseDragonLayer):
         # runners in the cuda graph manager
         kwargs.pop("dynamic_inference_decode_only", None)
         residual, y_mixer = self._forward_mixer(*args, **kwargs) # (L, B, H, D)
-        if not self.config.layernorm_zero_centered_gamma:
-            y_mixer = self.mixer_norm(y_mixer) * self.mixer_norm_scalers
-        else:
-            y_mixer = self.mixer_norm(y_mixer) * (self.mixer_norm_scalers + 1.) # todo: torch.compile
-        
-        y_mixer = y_mixer.view(y_mixer.size(0), y_mixer.size(1), -1).float() # (L, B, H*D) # TEMP: float
-
+        y_mixer = self._torch_compiled_headwise_norm(y_mixer)
+        y_mixer = y_mixer.view(y_mixer.size(0), y_mixer.size(1), -1).float() # (L, B, H*D) # TODO TEMP: float
         nvtx_range_push(suffix="mixer_proj")
         if self.offload_mixer_proj:
             y_mixer = fine_grained_offloading_group_start(y_mixer, name="mixer_proj")
@@ -438,21 +433,15 @@ class DragonLayer(GraphableMegatronModule, BaseDragonLayer):
             )
         nvtx_range_pop(suffix="mixer_proj")
 
-        # TODO
         # tp=1: 600, tp=4: 340 when returning residual+y_mixer
         # while after mixer_proj, tp=1,tp=4: 190 for both
 
-        return y_mixer
-        hidden_states = self.sqrt_one_minus_tau * residual + self.sqrt_tau * y_mixer # todo: torch.compile
-        residual = hidden_states
+        residual = self._torch_compiled_residual_write(residual, y_mixer, self.sqrt_one_minus_tau, self.sqrt_tau)
 
+        hidden_states = self.pre_mlp_norm(residual)
+        y_mlp = self._forward_mlp(hidden_states, kwargs.get("inference_context", None))
+        residual = self._torch_compiled_residual_write(residual, y_mlp, self.sqrt_one_minus_tau, self.sqrt_tau)
         return residual
-
-        hidden_states = self.pre_mlp_norm(hidden_states)
-        output = self._forward_mlp(hidden_states, kwargs.get("inference_context", None))
-        hidden_states = self.sqrt_one_minus_tau * residual + self.sqrt_tau * output # todo: torch.compile
-
-        return hidden_states
 
     def _forward_mixer(
         self,
@@ -593,6 +582,19 @@ class DragonLayer(GraphableMegatronModule, BaseDragonLayer):
         nvtx_range_pop(suffix="mlp")
 
         return mlp_output_with_bias[0]
+
+    #@torch.compile # TODO: reactive. it's disabled during tests
+    def _torch_compiled_headwise_norm(self, y_mixer):
+        if not self.config.layernorm_zero_centered_gamma:
+            y_mixer = self.mixer_norm(y_mixer) * self.mixer_norm_scalers
+        else:
+            y_mixer = self.mixer_norm(y_mixer) * (self.mixer_norm_scalers + 1.)
+        return y_mixer
+    
+    #@torch.compile # TODO: reactive. it's disabled during tests
+    def _torch_compiled_residual_write(self, residual, y_mixer, a, b):
+        residual = a * residual + b * y_mixer
+        return residual
 
     def sharded_state_dict(
         self, prefix: str = '', sharded_offsets: tuple = (), metadata: Optional[dict] = None

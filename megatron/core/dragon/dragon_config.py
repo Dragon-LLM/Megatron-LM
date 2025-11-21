@@ -59,6 +59,8 @@ class DragonConfig(ModelParallelConfig):
     mtp_loss_scaling_factor: Optional[float] = None
     """Weighting factor of Multi-Token Prediction (MTP) loss."""
 
+    layers_config: str = 'gggTggg'
+
     num_layers_in_first_pipeline_stage: Optional[int] = None
     """Number of Dragon layers on first pipeline stage.
     None implies equal layer division across PP ranks."""
@@ -735,7 +737,7 @@ class DragonConfig(ModelParallelConfig):
     """ Multimodal rope section is for channel dimension of temporal, height and width
     in rope calculation. """
 
-    is_hybrid_model: bool = False
+    is_hybrid_model: bool = True
     """ Indicates whether this is a hybrid model. """
 
     mamba_state_dim: int = 128
@@ -761,7 +763,7 @@ class DragonConfig(ModelParallelConfig):
     heterogeneous_block_specs: bool = False
     """Whether to use heterogeneous block specs (nemotron-nas architecture)."""
 
-    hetereogenous_dist_checkpoint: bool = False
+    hetereogenous_dist_checkpoint: bool = True
     """Whether to use heterogenous layers in distributed checkpoint."""
 
     ####################
