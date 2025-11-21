@@ -17,6 +17,7 @@ from megatron.core.models.common.embeddings.rotary_pos_embedding import (
     RotaryEmbedding,
 )
 from megatron.core.models.common.language_module.language_module import LanguageModule
+from megatron.core.extensions.transformer_engine import TEColumnParallelLinear
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     fine_grained_offloading_init_chunk_handler,
@@ -230,21 +231,21 @@ class DragonModel(LanguageModule):
                 self.embedding_activation_buffer = None
                 self.grad_output_buffer = None
 
-            self.output_layer = tensor_parallel.ColumnParallelLinear(
-                config.hidden_size,
-                self.vocab_size,
+            self.output_layer = TEColumnParallelLinear(
+                input_size=config.hidden_size,
+                output_size=self.vocab_size,
                 config=config,
                 init_method=config.init_method,
+                gather_output=not self.parallel_output,
                 bias=False,
                 skip_bias_add=False,
-                gather_output=not self.parallel_output,
-                skip_weight_param_allocation=self.pre_process
-                and self.share_embeddings_and_output_weights,
-                embedding_activation_buffer=self.embedding_activation_buffer,
-                grad_output_buffer=self.grad_output_buffer,
+                skip_weight_param_allocation=self.pre_process and self.share_embeddings_and_output_weights,
+                is_expert=False,
+                tp_comm_buffer_name="output_layer",
                 tp_group=self.pg_collection.tp,
+                alpha=1/config.hidden_size if config.use_uscaling else None, # TODO : correct backward scaler!!
+                uscaling_scaling=False,
             )
-            # todo : change this one!
 
         if self.pre_process or self.post_process or self.mtp_process:
             self.setup_embeddings_and_output_layer()
@@ -574,8 +575,6 @@ class DragonModel(LanguageModule):
                 # output
                 mtp_logits, _ = self.output_layer(
                     hidden_states_list[mtp_layer_number + 1],
-                    weight=output_weight,
-                    runtime_gather_output=runtime_gather_output,
                 )
                 # Calc loss for the current Multi-Token Prediction (MTP) layers.
                 mtp_labels, _ = roll_tensor(mtp_labels, shifts=-1, dims=-1, cp_group=self.cp_group)
@@ -630,7 +629,7 @@ class DragonModel(LanguageModule):
                 ).unsqueeze(1)
 
         logits, _ = self.output_layer(
-            hidden_states, weight=output_weight, runtime_gather_output=runtime_gather_output
+            hidden_states,
         )
 
         if just_logits:
