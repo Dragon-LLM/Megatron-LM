@@ -1,7 +1,7 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 from collections import OrderedDict
-from typing import Dict, Literal, Optional
+from typing import Dict, Literal, Optional, Tuple
 
 import torch
 from torch import Tensor
@@ -33,19 +33,19 @@ from megatron.core.transformer.multi_token_prediction import (
     tie_word_embeddings_state_dict,
 )
 from megatron.core.transformer.spec_utils import ModuleSpec
-from megatron.core.transformer.transformer_block import TransformerBlock
-from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.dragon.dragon_block import DragonBlock
+from megatron.core.dragon.dragon_config import DragonConfig
 from megatron.core.utils import WrappedTensor, deprecate_inference_params
 
 
-class GPTModel(LanguageModule):
-    """GPT Transformer language model.
+class DragonModel(LanguageModule):
+    """Dragon language model.
 
     Args:
-        config (TransformerConfig):
+        config (DragonConfig):
             Transformer config
-        transformer_layer_spec (ModuleSpec):
-            Specifies module to use for transformer layers
+        dragon_layer_spec (ModuleSpec):
+            Specifies module to use for dragon layers
         vocab_size (int):
             Vocabulary size
         max_sequence_length (int):
@@ -83,8 +83,8 @@ class GPTModel(LanguageModule):
 
     def __init__(
         self,
-        config: TransformerConfig,
-        transformer_layer_spec: ModuleSpec,
+        config: DragonConfig,
+        dragon_layer_spec: ModuleSpec,
         vocab_size: int,
         max_sequence_length: int,
         pre_process: bool = True,
@@ -92,9 +92,7 @@ class GPTModel(LanguageModule):
         fp16_lm_cross_entropy: bool = False,
         parallel_output: bool = True,
         share_embeddings_and_output_weights: bool = False,
-        position_embedding_type: Literal[
-            'learned_absolute', 'rope', 'mrope', 'yarn', 'none'
-        ] = 'learned_absolute',
+        position_embedding_type: Literal['learned_absolute', 'rope', 'mrope', 'yarn', 'none'] = 'none',
         rotary_percent: float = 1.0,
         rotary_base: int = 10000,
         rope_scaling: bool = False,
@@ -110,7 +108,7 @@ class GPTModel(LanguageModule):
         if has_config_logger_enabled(config):
             log_config_to_disk(config, locals(), prefix=type(self).__name__)
 
-        self.transformer_layer_spec: ModuleSpec = transformer_layer_spec
+        self.dragon_layer_spec: ModuleSpec = dragon_layer_spec
         self.vocab_size = vocab_size
         self.max_sequence_length = max_sequence_length
         self.pre_process = pre_process
@@ -164,7 +162,6 @@ class GPTModel(LanguageModule):
                 use_cpu_initialization=self.config.use_cpu_initialization,
                 cp_group=self.pg_collection.cp,
             )
-
         elif self.position_embedding_type == 'yarn':
             self.rotary_pos_emb = YarnRotaryEmbedding(
                 kv_channels=self.config.kv_channels,
@@ -202,9 +199,9 @@ class GPTModel(LanguageModule):
         self.rotary_pos_emb_cache = {}
 
         # Transformer.
-        self.decoder = TransformerBlock(
+        self.decoder = DragonBlock(
             config=self.config,
-            spec=transformer_layer_spec,
+            spec=dragon_layer_spec,
             pre_process=self.pre_process,
             post_process=self.post_process,
             pg_collection=self.pg_collection,
@@ -218,7 +215,6 @@ class GPTModel(LanguageModule):
 
         # Output
         if self.post_process:
-
             if self.config.defer_embedding_wgrad_compute:
                 # The embedding activation buffer preserves a reference to the input activations
                 # of the final embedding projection layer GEMM. It will hold the activations for
@@ -248,6 +244,7 @@ class GPTModel(LanguageModule):
                 grad_output_buffer=self.grad_output_buffer,
                 tp_group=self.pg_collection.tp,
             )
+            # todo : change this one!
 
         if self.pre_process or self.post_process or self.mtp_process:
             self.setup_embeddings_and_output_layer()
@@ -436,8 +433,10 @@ class GPTModel(LanguageModule):
         input_ids: Tensor,
         position_ids: Tensor,
         attention_mask: Tensor,
+        window_size: Optional[Tuple[int, int]] = None,
         decoder_input: Tensor = None,
         labels: Tensor = None,
+        just_logits: bool = False,
         inference_context: BaseInferenceContext = None,
         packed_seq_params: PackedSeqParams = None,
         extra_block_kwargs: dict = None,
@@ -484,6 +483,7 @@ class GPTModel(LanguageModule):
             rotary_pos_cos=rotary_pos_cos,
             rotary_pos_sin=rotary_pos_sin,
             rotary_pos_cos_sin=rotary_pos_cos_sin,
+            window_size=window_size,
             packed_seq_params=packed_seq_params,
             sequence_len_offset=sequence_len_offset,
             **(extra_block_kwargs or {}),
@@ -498,6 +498,7 @@ class GPTModel(LanguageModule):
             rotary_pos_cos=rotary_pos_cos,
             rotary_pos_sin=rotary_pos_sin,
             mtp_in_postprocess=self.mtp_process,
+            just_logits=just_logits,
             loss_mask=loss_mask,
             decoder_input=decoder_input,
             attention_mask=attention_mask,
@@ -519,6 +520,7 @@ class GPTModel(LanguageModule):
         rotary_pos_cos,
         rotary_pos_sin,
         mtp_in_postprocess=None,
+        just_logits=False,
         loss_mask=None,
         decoder_input=None,
         attention_mask=None,
@@ -630,6 +632,9 @@ class GPTModel(LanguageModule):
         logits, _ = self.output_layer(
             hidden_states, weight=output_weight, runtime_gather_output=runtime_gather_output
         )
+
+        if just_logits:
+            return logits
 
         # Restore sequence parallel execution to the output layer if necessary.
         if sequence_parallel_override:
