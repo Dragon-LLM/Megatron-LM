@@ -50,6 +50,8 @@ def build_tokenizer(args, **kwargs):
         tokenizer = _HuggingFaceTokenizer(
             args.tokenizer_model, trust_remote_code=args.trust_remote_code, **kwargs
         )
+    elif args.tokenizer_type == 'HuggingFacePretrainedTokenizer':
+        tokenizer = _HuggingFacePretrainedTokenizer(args.tokenizer_model, **kwargs)
     elif args.tokenizer_type == 'Llama2Tokenizer':
         assert args.tokenizer_model is not None
         tokenizer = _Llama2Tokenizer(args.tokenizer_model)
@@ -190,6 +192,42 @@ class _HuggingFaceTokenizer(MegatronLegacyTokenizer):
     def pad(self):
         return self._tokenizer.pad_token_id
 
+class _HuggingFacePretrainedTokenizer(MegatronLegacyTokenizer):
+    def __init__(self, pretrained_model_name_path: str, **kwargs):
+        super().__init__(pretrained_model_name_path, **kwargs)
+        try:
+            import tokenizers
+        except ImportError:
+            raise EnvironmentError(f"The tokenizers library must be installed to use huggingface_tokenizer_provider")
+        self._tokenizer = tokenizers.Tokenizer.from_file(pretrained_model_name_path)
+        self._vocab = self._tokenizer.get_vocab()
+        self._inv_vocab = {token_id: token for token, token_id in self._vocab.items()}
+        
+    @property
+    def vocab_size(self):
+        return self._tokenizer.get_vocab_size()
+    
+    @property
+    def vocab(self):
+        return self._vocab
+    
+    @property
+    def inv_vocab(self):
+        return self._inv_vocab
+    
+    @property
+    def decoder(self):
+        return self._inv_vocab
+    
+    def tokenize(self, text, **kwargs):
+        return self._tokenizer.encode(text).ids
+    
+    def detokenize(self, token_ids, **kwargs):
+        return self._tokenizer.decode(token_ids)
+    
+    @property
+    def eod(self):
+        return self._tokenizer.token_to_id("<|endoftext|>")
 
 class _BertWordPieceTokenizer(MegatronLegacyTokenizer):
     """Original BERT wordpiece tokenizer."""

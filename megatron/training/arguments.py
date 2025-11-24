@@ -2861,6 +2861,7 @@ def _add_tokenizer_args(parser):
                                 'SentencePieceTokenizer',
                                 'GPTSentencePieceTokenizer',
                                 'HuggingFaceTokenizer',
+                                'HuggingFacePretrainedTokenizer',
                                 'Llama2Tokenizer',
                                 'TikTokenizer',
                                 'MultimodalTokenizer',

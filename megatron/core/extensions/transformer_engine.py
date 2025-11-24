@@ -920,6 +920,11 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
                 f"setting query key layer scaling via argument, so these two must match."
             )
 
+        if num_attention_heads is None:
+            num_attention_heads = self.config.num_attention_heads
+        if num_query_groups is None:
+            num_query_groups = self.config.num_query_groups
+
         extra_kwargs: dict[str, Any] = {}
         extra_kwargs["num_gqa_groups"] = num_query_groups
 
