@@ -2,6 +2,7 @@
 import logging
 import warnings
 from typing import Callable, Dict, List, Optional, Tuple
+import math
 
 import torch
 from torch.optim import SGD as CPUSGD
@@ -31,6 +32,8 @@ except ImportError:
 
         USING_PYTORCH_OPTIMIZER = True
 
+import transformer_engine as te
+
 from megatron.core import parallel_state
 from megatron.core.optimizer.cpu_offloading.hybrid_optimizer import HybridDeviceOptimizer
 from megatron.core.process_groups_config import ProcessGroupCollection
@@ -51,6 +54,142 @@ from .optimizer import (
 from .optimizer_config import OptimizerConfig
 
 logger = logging.getLogger(__name__)
+
+
+def _get_param_groups_uscaling(
+    model_chunks: List[MegatronModule],
+    base_lr: float,
+    lr_mult_emb: float,
+    lr_mult_scalar: float,
+    lr_mult_head: float,
+) -> List[Dict]:
+
+    # Map (wd_mult, lr_mult, is_expert_parallel, is_decoupled_lr) to params.
+    params_map = {}
+    for model_chunk in model_chunks:
+        seen = set()
+        for name, mod in model_chunk.named_modules():
+            if isinstance(mod, (te.pytorch.Linear, te.pytorch.LayerNormLinear, te.pytorch.GroupedLinear)):
+                assert hasattr(mod, "row_parallel")
+                size_mult = 1
+                if mod.row_parallel:
+                    size_mult = parallel_state.get_tensor_model_parallel_world_size()     
+
+                if isinstance(mod, te.pytorch.GroupedLinear):
+                    num_weights = mod.num_gemms
+                else:
+                    num_weights = 1
+
+                for w_idx in range(num_weights if num_weights > 0 else 1):
+                    weight_attr = "weight" if num_weights == 1 else f"weight{w_idx}"
+                    weight = getattr(mod, weight_attr)
+
+                    if not weight.requires_grad:
+                        continue           
+
+                    is_expert_parallel = not (getattr(mod, 'allreduce', True) and getattr(weight, 'allreduce', True))
+                    is_decoupled_lr = False
+                    is_scalar = getattr(mod, "is_scalar_weight", False)
+
+                    # compute wd_mult, lr_mult
+                    if "output_layer" in name:
+                        _lr_mult = lr_mult_head
+                        _wd_mult = 0.
+                    elif is_scalar:
+                        _lr_mult = lr_mult_scalar
+                        _wd_mult = 0.
+                    else: # hidden matrix weight
+                        fan_in = size_mult * weight.shape[1]
+                        _lr_mult = 1 / math.sqrt(fan_in)
+                        _wd_mult = 1.
+                    _wd_mult = _wd_mult / (base_lr * _lr_mult) # truly decoupled weight decay
+
+                    #if parallel_state.get_data_parallel_rank() == 0 and parallel_state.get_tensor_model_parallel_rank() == 0:
+                    #    print(f"param {name}.{weight_attr} | shape {weight.shape} (multiplied: {size_mult}) | lr_mult={_lr_mult:.3e} | wd_mult={_wd_mult:.3e} | is_expert_parallel={is_expert_parallel}")
+
+                    key = (_wd_mult, _lr_mult, is_expert_parallel, is_decoupled_lr)
+                    if key not in params_map:
+                        params_map[key] = []
+                    params_map[key].append(weight)
+                    seen.add(weight)
+
+                    bias_attr = "bias" if num_weights == 1 else f"bias{w_idx}"
+                    bias = getattr(mod, bias_attr, None)
+                    if bias is not None and bias.requires_grad:
+                        is_expert_parallel = not getattr(bias, 'allreduce', True)
+                        is_decoupled_lr = False
+                        _lr_mult = lr_mult_scalar
+                        _wd_mult = 0.
+
+                        _wd_mult = _wd_mult / (base_lr * _lr_mult) # truly decoupled weight decay
+
+                        key = (_wd_mult, _lr_mult, is_expert_parallel, is_decoupled_lr)
+                        if key not in params_map:
+                            params_map[key] = []
+                        params_map[key].append(bias)
+                        seen.add(bias)
+
+                        #if parallel_state.get_data_parallel_rank() == 0:
+                        #    print(f"param {name}.{bias_attr} | shape {mod.bias.shape} | lr_mult={_lr_mult:.3e} | wd_mult={_wd_mult:.3e}")
+
+        for name, param in model_chunk.named_parameters():
+            if not param.requires_grad:
+                continue
+            if param in seen:
+                continue
+
+            is_expert_parallel = not getattr(param, 'allreduce', True)
+            is_decoupled_lr = False
+
+            # compute wd_mult, lr_mult
+            if "embedding" in name:
+                _lr_mult = lr_mult_emb
+                _wd_mult = 0.
+            else:
+                _lr_mult = lr_mult_scalar
+                _wd_mult = 0.
+            
+            if getattr(param, 'requires_weight_decay', False):
+                _wd_mult = 1.0
+
+            _wd_mult = _wd_mult / (base_lr * _lr_mult) # truly decoupled weight decay
+
+            key = (_wd_mult, _lr_mult, is_expert_parallel, is_decoupled_lr)
+            if key not in params_map:
+                params_map[key] = []
+            params_map[key].append(param)
+
+            #if parallel_state.get_data_parallel_rank() == 0 and parallel_state.get_tensor_model_parallel_rank() == 0:
+            #    print(f"param {name} | shape {param.shape} | lr_mult={_lr_mult:.3e} | wd_mult={_wd_mult:.3e} | is_expert_parallel={is_expert_parallel}")
+    
+    # Distributed checkpoint requires all ranks to have the same param groups,
+    # so we need to align the param groups across ranks, otherwise we may have
+    # runtime error when loading the checkpoint or numerical error when resuming training.
+    params_key = list(params_map.keys())
+    gathered_params_key = [None for _ in range(torch.distributed.get_world_size())]
+    torch.distributed.all_gather_object(gathered_params_key, params_key)
+    for keys in gathered_params_key:
+        for key in keys:
+            if key not in params_key:
+                params_key.append(key)
+
+    param_groups = []
+    for key in params_key:
+        wd_mult, _lr_mult, is_expert_parallel, is_decoupled_lr = key
+        params = params_map[key] if key in params_map else []
+        param_group = {
+            'params': params,
+            'wd_mult': wd_mult,
+            'lr_mult': _lr_mult,
+            'is_expert_parallel': is_expert_parallel,
+            'is_decoupled_lr': is_decoupled_lr,
+        }
+        # Ensure param_group has required keys for matching when loading optimizer state
+        # See MegatronOptimizer._filter_and_reorder_param_groups.
+        assert set(param_group.keys()) - set(param_group_identifier_keys) == {'params'}
+        param_groups.append(param_group)
+
+    return param_groups
 
 
 def _get_param_groups(
@@ -223,6 +362,7 @@ def _get_param_groups_and_buffers(
     model_chunks: List[MegatronModule],
     model_chunk_offset: int,
     config: OptimizerConfig,
+    uscaling: bool,
     no_weight_decay_cond: Optional[Callable],
     scale_lr_cond: Optional[Callable],
     lr_mult: float,
@@ -253,17 +393,26 @@ def _get_param_groups_and_buffers(
     Returns:
         List of parameter groups and dictionary of model chunk IDs to buffers.
     """
-    param_groups = _get_param_groups(
-        model_chunks,
-        no_weight_decay_cond,
-        scale_lr_cond,
-        lr_mult,
-        lr=config.lr,
-        min_lr=config.min_lr,
-        decoupled_lr=config.decoupled_lr,
-        decoupled_min_lr=config.decoupled_min_lr,
-        default_skip_embedding_weight_decay=default_skip_embedding_weight_decay,
-    )
+    if not uscaling:
+        param_groups = _get_param_groups(
+            model_chunks,
+            no_weight_decay_cond,
+            scale_lr_cond,
+            lr_mult,
+            lr=config.lr,
+            min_lr=config.min_lr,
+            decoupled_lr=config.decoupled_lr,
+            decoupled_min_lr=config.decoupled_min_lr,
+            default_skip_embedding_weight_decay=default_skip_embedding_weight_decay,
+        )
+    else:
+        param_groups = _get_param_groups_uscaling(
+            model_chunks,
+            base_lr=config.lr,
+            lr_mult_emb=config.lr_mult_emb,
+            lr_mult_scalar=config.lr_mult_scalar,
+            lr_mult_head=config.lr_mult_head,
+        )
     param_groups = list(filter(filter_fn, param_groups))
     buffers = {}
     for model_chunk_idx, model_chunk in enumerate(model_chunks):
@@ -476,6 +625,7 @@ def _get_megatron_optimizer_based_on_param_groups(
 def get_megatron_optimizer(
     config: OptimizerConfig,
     model_chunks: List[MegatronModule],
+    uscaling: bool = False,
     no_weight_decay_cond: Optional[Callable] = None,
     scale_lr_cond: Optional[Callable] = None,
     lr_mult: float = 1.0,
@@ -553,6 +703,7 @@ def get_megatron_optimizer(
                 model_chunk,
                 model_chunk_offset=model_chunk_offset,
                 config=config,
+                uscaling=uscaling,
                 no_weight_decay_cond=no_weight_decay_cond,
                 scale_lr_cond=scale_lr_cond,
                 lr_mult=lr_mult,
@@ -592,6 +743,7 @@ def get_megatron_optimizer(
             dense_model_chunks,
             model_chunk_offset=model_chunk_offset,
             config=config,
+            uscaling=uscaling,
             no_weight_decay_cond=no_weight_decay_cond,
             scale_lr_cond=scale_lr_cond,
             lr_mult=lr_mult,
@@ -631,6 +783,7 @@ def get_megatron_optimizer(
         model_chunks,
         model_chunk_offset=0,
         config=config,
+        uscaling=uscaling,
         no_weight_decay_cond=no_weight_decay_cond,
         scale_lr_cond=scale_lr_cond,
         lr_mult=lr_mult,

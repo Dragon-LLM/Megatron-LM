@@ -1212,6 +1212,7 @@ def setup_model_and_optimizer(
         optimizer = get_megatron_optimizer(
             config,
             model,
+            args.use_uscaling,
             no_wd_decay_cond,
             scale_lr_cond,
             lr_mult,

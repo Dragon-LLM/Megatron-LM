@@ -23,6 +23,15 @@ class OptimizerConfig:
        iteration would be different.
     """
 
+    lr_mult_emb: Optional[float] = None
+    """Learning rate multiplier for embedding layers. uscaling only"""
+
+    lr_mult_scalar: Optional[float] = None
+    """Learning rate multiplier for scalar parameters (e.g., layernorm and bias). uscaling only"""
+
+    lr_mult_head: Optional[float] = None
+    """Learning rate multiplier for output head layers. uscaling only"""
+
     min_lr: Optional[float] = None
     """Minumum value for learning rate. The scheduler clip values below this threshold."""
 

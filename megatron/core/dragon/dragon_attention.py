@@ -991,7 +991,6 @@ class DiffAttention(MegatronModule, ABC):
                 query = fine_grained_offloading_group_start(query, name="core_attn")
             if inference_context is None or inference_context.is_static_batching():
                 # Static batching attention kernel.
-                print(window_size)
                 with get_fine_grained_offloading_context(self.offload_core_attention):
                     core_attn_out_1 = self.core_attention1(
                         query_sig.bfloat16(),

@@ -285,6 +285,7 @@ class TELinear(te.pytorch.Linear):
             )
 
         self.config = config
+        self.row_parallel = True if parallel_mode == "row" else False
 
         # TE returns a zero length Tensor when bias=False and
         # return_bias=True, but we prefer None.  So in that case we
@@ -497,6 +498,7 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
             )
 
         self.config = config
+        self.row_parallel = False
 
         if gather_output:
             raise ValueError("Transformer Engine linear layers do not support gather_output = True")
@@ -1166,6 +1168,7 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             uscaling_scaling: Optional[bool] = None,
         ):
             self.config = config
+            self.row_parallel = True if parallel_mode == "row" else False
 
             # TE returns a zero length Tensor when bias=False and
             # return_bias=True, but we prefer None.  So in that case we
