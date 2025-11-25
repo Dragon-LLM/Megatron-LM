@@ -630,6 +630,7 @@ def pretrain(
     non_loss_data_func=None,
     store=None,
     inprocess_call_wrapper: Optional[CallWrapper] = None,
+    g_scheduler=None,
 ):
     """Main training program.
 
@@ -763,6 +764,9 @@ def pretrain(
         checkpointing_context=checkpointing_context,
         no_wd_decay_cond=no_wd_decay_cond,
     )
+
+    if g_scheduler is not None:
+        g_scheduler['scheduler'] = opt_param_scheduler
 
     timers('model-and-optimizer-setup').stop()
     print_datetime('after model, optimizer, and learning rate ' 'scheduler are built')
@@ -1155,6 +1159,11 @@ def get_optimizer_param_scheduler(optimizer):
         end_wd=args.end_weight_decay,
         wd_incr_steps=wd_incr_steps,
         wd_incr_style=args.weight_decay_incr_style,
+        slw_warmup_steps=args.slw_warmup_steps,
+        slw_start=args.slw_start,
+        slw_end=args.seq_length,
+        slw_increment=args.slw_increment,
+        global_batch_size=args.global_batch_size,
         use_checkpoint_opt_param_scheduler=args.use_checkpoint_opt_param_scheduler,
         override_opt_param_scheduler=args.override_opt_param_scheduler,
         wsd_decay_steps=wsd_decay_steps,
@@ -1484,6 +1493,7 @@ def training_log(
     total_loss_dict,
     learning_rate,
     decoupled_learning_rate,
+    wsize,
     iteration,
     loss_scale,
     report_memory_flag,
@@ -1582,6 +1592,10 @@ def training_log(
         writer.add_scalar('learning-rate vs samples', learning_rate, args.consumed_train_samples)
         if wandb_writer:
             wandb_writer.log({'learning-rate': learning_rate}, iteration)
+        writer.add_scalar('wsize', wsize, iteration)
+        writer.add_scalar('wsize vs samples', wsize, args.consumed_train_samples)
+        if wandb_writer:
+            wandb_writer.log({'wsize': wsize}, iteration)
         if args.decoupled_lr is not None:
             writer.add_scalar('decoupled-learning-rate', decoupled_learning_rate, iteration)
         if args.skipped_train_samples > 0:
@@ -1729,6 +1743,7 @@ def training_log(
                 wandb_writer.log({'power/gpu': power}, iteration)
         # Decoupled_learning_rate should be not None only on first and last pipeline stage.
         log_string += f' learning rate: {learning_rate:.6E} |'
+        log_string += f' wsize: {wsize} |'
         if args.decoupled_lr is not None and (
             mpu.is_pipeline_first_stage(ignore_virtual=True)
             or mpu.is_pipeline_last_stage(ignore_virtual=True)
@@ -2507,6 +2522,7 @@ def train(
             total_loss_dict,
             learning_rate,
             decoupled_learning_rate,
+            opt_param_scheduler.get_wsize(),
             iteration,
             loss_scale,
             report_memory_flag,

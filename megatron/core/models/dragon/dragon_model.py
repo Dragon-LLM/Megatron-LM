@@ -116,7 +116,7 @@ class DragonModel(LanguageModule):
         self.post_process = post_process
         self.fp16_lm_cross_entropy = fp16_lm_cross_entropy
         self.parallel_output = parallel_output
-        self.share_embeddings_and_output_weights = share_embeddings_and_output_weights
+        assert not share_embeddings_and_output_weights
         self.vp_stage = vp_stage
         self.disable_param_offloading = True
 
@@ -239,7 +239,7 @@ class DragonModel(LanguageModule):
                 gather_output=not self.parallel_output,
                 bias=False,
                 skip_bias_add=False,
-                skip_weight_param_allocation=self.pre_process and self.share_embeddings_and_output_weights,
+                skip_weight_param_allocation=False,
                 is_expert=False,
                 tp_comm_buffer_name="output_layer",
                 tp_group=self.pg_collection.tp,
@@ -498,6 +498,7 @@ class DragonModel(LanguageModule):
             rotary_pos_emb=rotary_pos_emb,
             rotary_pos_cos=rotary_pos_cos,
             rotary_pos_sin=rotary_pos_sin,
+            window_size=window_size,
             mtp_in_postprocess=self.mtp_process,
             just_logits=just_logits,
             loss_mask=loss_mask,
@@ -520,6 +521,7 @@ class DragonModel(LanguageModule):
         rotary_pos_emb,
         rotary_pos_cos,
         rotary_pos_sin,
+        window_size,
         mtp_in_postprocess=None,
         just_logits=False,
         loss_mask=None,
@@ -542,9 +544,6 @@ class DragonModel(LanguageModule):
             assert runtime_gather_output, "Inference must always gather TP logits"
 
         # logits and loss
-        output_weight = None
-        if self.share_embeddings_and_output_weights:
-            output_weight = self.shared_embedding_or_output_weight()
         if mtp_in_postprocess:
             hidden_states = self.mtp(
                 input_ids=input_ids,
@@ -555,6 +554,7 @@ class DragonModel(LanguageModule):
                 rotary_pos_emb=rotary_pos_emb,
                 rotary_pos_cos=rotary_pos_cos,
                 rotary_pos_sin=rotary_pos_sin,
+                window_size=window_size,
                 packed_seq_params=packed_seq_params,
                 sequence_len_offset=sequence_len_offset,
                 embedding=self.embedding,

@@ -12,7 +12,7 @@ logger = logging.getLogger(__name__)
 
 
 class OptimizerParamScheduler:
-    """Anneals learning rate and weight decay
+    """Anneals learning rate and weight decay, ramp up window size
 
     Args:
         optimizer (MegatronOptimizer): the optimizer to be used
@@ -26,6 +26,11 @@ class OptimizerParamScheduler:
         end_wd (float): final weight decay
         wd_incr_steps (int): number of weight decay increment steps
         wd_incr_style (str): weight decay increment style
+        slw_warmup_steps (int, optional): number of steps to warmup the sliding window over
+        slw_start (int, optional): starting window size for sliding window
+        slw_end (int, optional): ending window size for sliding window
+        slw_increment (int, optional): increment for sliding window
+        global_batch_size (int, optional): global batch size
         use_checkpoint_opt_param_scheduler (bool, optional): whether to use the checkpoint values
             for the optimizer param scheduler
         override_opt_param_scheduler (bool, optional): whether to override the optimizer param
@@ -49,6 +54,11 @@ class OptimizerParamScheduler:
         end_wd: float,
         wd_incr_steps: int,
         wd_incr_style: str,
+        slw_warmup_steps: int = 0,
+        slw_start: int = 0,
+        slw_end: int = 0,
+        slw_increment: int = 0,
+        global_batch_size: int = 0,
         use_checkpoint_opt_param_scheduler: Optional[bool] = True,
         override_opt_param_scheduler: Optional[bool] = False,
         wsd_decay_steps: Optional[int] = None,
@@ -83,6 +93,12 @@ class OptimizerParamScheduler:
         assert self.end_wd >= self.start_wd
         self.wd_incr_steps = wd_incr_steps
         self.wd_incr_style = wd_incr_style
+
+        self.slw_warmup_steps = slw_warmup_steps
+        self.slw_start = slw_start
+        self.slw_end = slw_end
+        self.slw_increment = slw_increment
+        self.global_batch_size = global_batch_size
 
         self.override_opt_param_scheduler = override_opt_param_scheduler
         self.use_checkpoint_opt_param_scheduler = use_checkpoint_opt_param_scheduler
@@ -183,6 +199,15 @@ class OptimizerParamScheduler:
         assert coeff is not None
 
         return min_lr + coeff * delta_lr
+
+    def get_wsize(self) -> int:
+        if self.slw_warmup_steps == 0:
+            return self.slw_end
+        progress_ratio = (self.num_steps / self.global_batch_size) / self.slw_warmup_steps
+        window = self.slw_start + progress_ratio * (self.slw_end - self.slw_start) # linear scheduling
+        window = self.slw_increment * math.ceil(window / self.slw_increment) # quantize
+        window = int(min(window, self.slw_end)) # cap
+        return window
 
     def step(self, increment: int) -> None:
         """Set lr for all parameters groups.

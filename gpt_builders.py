@@ -156,7 +156,7 @@ def dragon_builder(args, pre_process, post_process, vp_stage=None, config=None):
         post_process=post_process,
         fp16_lm_cross_entropy=args.fp16_lm_cross_entropy,
         parallel_output=True,
-        share_embeddings_and_output_weights=not args.untie_embeddings_and_output_weights,
+        share_embeddings_and_output_weights=False,
         position_embedding_type=args.position_embedding_type,
         rotary_percent=args.rotary_percent,
         rotary_base=args.rotary_base,

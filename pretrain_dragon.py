@@ -41,6 +41,7 @@ except ImportError:
     has_nvidia_modelopt = False
 
 stimer = StragglerDetector()
+g_scheduler = {'scheduler': None}
 
 
 def get_batch(data_iterator, vp_stage: Optional[int] = None):
@@ -252,18 +253,18 @@ def forward_step(data_iterator, model: DragonModel, return_schedule_plan: bool =
 
     with stimer:
         if args.use_legacy_models:
-            output_tensor = model(tokens, position_ids, attention_mask, labels=labels, packed_seq_params=packed_seq_params)
+            output_tensor = model(tokens, position_ids, attention_mask, labels=labels, window_size=(g_scheduler["scheduler"].get_wsize(), 0), packed_seq_params=packed_seq_params)
         else:
             if return_schedule_plan:
                 assert args.overlap_moe_expert_parallel_comm, \
                     "overlap_moe_expert_parallel_comm must be enabled to return the schedule plan"
                 schedule_plan = model.build_schedule_plan(
-                    tokens, position_ids, attention_mask, labels=labels, loss_mask=loss_mask, packed_seq_params=packed_seq_params,
+                    tokens, position_ids, attention_mask, labels=labels, loss_mask=loss_mask, window_size=(g_scheduler["scheduler"].get_wsize(), 0), packed_seq_params=packed_seq_params,
                 )
                 return schedule_plan, partial(loss_func, loss_mask, model=model)
             else:
                 output_tensor = model(
-                    tokens, position_ids, attention_mask, labels=labels, loss_mask=loss_mask, packed_seq_params=packed_seq_params,
+                    tokens, position_ids, attention_mask, labels=labels, loss_mask=loss_mask, window_size=(g_scheduler["scheduler"].get_wsize(), 0), packed_seq_params=packed_seq_params,
                 )
 
     # [ModelOpt]: model is needed to access ModelOpt distillation losses
@@ -378,4 +379,5 @@ if __name__ == "__main__":
         extra_args_provider=add_modelopt_args if has_nvidia_modelopt else None,
         store=store,
         get_embedding_ranks=get_embedding_ranks,
+        g_scheduler=g_scheduler,
     )

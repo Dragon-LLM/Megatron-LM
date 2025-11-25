@@ -1740,6 +1740,9 @@ def _add_dragon_args(parser):
     # p-state-passing, not implemented yet
     group.add_argument('--intra-doc-masking', action='store_true')
     group.add_argument('--training-sequence-length', type=int, default=2048)
+    group.add_argument('--slw-warmup-steps', type=int, default=0)
+    group.add_argument('--slw-start', type=int, default=0)
+    group.add_argument('--slw-increment', type=int, default=0)
 
     return parser
 

@@ -183,7 +183,7 @@ class LanguageModule(MegatronModule):
         # we also need to maintain duplicated embedding weights in mtp process stage.
         # So we need to copy embedding weights from pre processing stage as initial parameters
         # in these cases.
-        if not self.share_embeddings_and_output_weights and not getattr(
+        if not getattr(
             self.config, 'mtp_num_layers', 0
         ):
             return
@@ -204,8 +204,7 @@ class LanguageModule(MegatronModule):
             self.shared_embedding_or_output_weight().shared_embedding = True
 
         if (
-            (self.post_process and self.share_embeddings_and_output_weights)
-            or getattr(self, 'mtp_process', False)
+            getattr(self, 'mtp_process', False)
         ) and not self.pre_process:
             assert not (
                 is_vp_first_stage(self.vp_stage, self.vp_size) and is_pp_first_stage(self.pp_group)
@@ -283,11 +282,7 @@ class LanguageModule(MegatronModule):
         output_layer_weight_key = f'{prefix}output_layer.weight'
         output_layer_bias_key = f'{prefix}output_layer.bias'
 
-        if self.share_embeddings_and_output_weights:
-            self.tie_embeddings_and_output_weights_state_dict(
-                sharded_state_dict, output_layer_weight_key, first_stage_word_emb_key
-            )
-        elif self.post_process:
+        if self.post_process:
             # Make sure the output layer follows the embeddings padding logic
             sharded_state_dict[output_layer_weight_key].allow_shape_mismatch = True
 

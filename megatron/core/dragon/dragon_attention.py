@@ -722,8 +722,9 @@ class DiffAttention(MegatronModule, ABC):
 
         """
 
-        if window_size is not None:
-            wsize = window_size[0]
+        if window_size is not None and window_size[0] != self.wsize_prev and self.pg_collection.tp.rank()==0 and self.pg_collection.dp.rank()==0:
+            print(f"[ATTN] Window size changed: {self.wsize_prev} -> {window_size[0]}")
+            self.wsize_prev = window_size[0]
 
         # Check if we need to skip RoPE
         # no_rope is 0-indexed array and self.layer_number is 1-indexed
@@ -990,6 +991,7 @@ class DiffAttention(MegatronModule, ABC):
                 query = fine_grained_offloading_group_start(query, name="core_attn")
             if inference_context is None or inference_context.is_static_batching():
                 # Static batching attention kernel.
+                print(window_size)
                 with get_fine_grained_offloading_context(self.offload_core_attention):
                     core_attn_out_1 = self.core_attention1(
                         query_sig.bfloat16(),
