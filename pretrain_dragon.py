@@ -11,7 +11,9 @@ from megatron.training import inprocess_restart
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
 from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig, MockGPTDataset
 from megatron.core.enums import ModelType
-from megatron.core.models.gpt import GPTModel
+from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.models.dragon import DragonModel
+from megatron.core.dragon.dragon_config import DragonConfig
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.utils import get_attr_wrapped_model, StragglerDetector
 from megatron.core.tokenizers.text.utils.build_tokenizer import build_tokenizer
@@ -26,7 +28,9 @@ from megatron.training.utils import (
 )
 from megatron.training.datasets.sft_dataset import SFTDataset
 from model_provider import model_provider
-from gpt_builders import gpt_builder
+from gpt_builders import dragon_builder
+
+import transformers
 
 try:
     from megatron.post_training.arguments import add_modelopt_args
@@ -42,11 +46,11 @@ stimer = StragglerDetector()
 def get_batch(data_iterator, vp_stage: Optional[int] = None):
     """Generate a batch."""
     args = get_args()
-    config = core_transformer_config_from_args(args)
+    config = core_transformer_config_from_args(args, config_class=DragonConfig)
     # TODO: this is pretty hacky, find a better way
     if not is_first_or_last_pipeline_stage(vp_stage) and (
     (not mtp_on_this_rank(config, ignore_virtual=False, vp_stage=vp_stage))):
-        return None, None, None, None, None
+        return None, None, None, None, None, None, None
 
     # get batches based on the TP rank you are on
     batch = get_batch_on_this_tp_rank(
@@ -65,14 +69,14 @@ SPIKY_LOSS_FACTOR = 10
 
 
 def loss_func(
-    loss_mask: torch.Tensor, output_tensor: torch.Tensor, model: Optional[GPTModel] = None
+    loss_mask: torch.Tensor, output_tensor: torch.Tensor, model: Optional[DragonModel] = None
 ):
     """Loss function.
 
     Args:
         loss_mask (torch.Tensor): Used to mask out some portions of the loss
         output_tensor (torch.Tensor): The tensor with the losses
-        model (GPTModel, optional): The model (can be wrapped)
+        model (DragonModel, optional): The model (can be wrapped)
 
     Returns:
         the loss scalar for this micro-batch
@@ -126,12 +130,104 @@ def loss_func(
     return (loss, num_tokens, {'lm loss': reporting_loss})
 
 
-def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = False):
+def debug_batch(tokens, position_ids, cu_seqlens, max_seqlen):
+    tok = transformers.AutoTokenizer.from_pretrained("gpt2")
+    # debug to check tokens
+    seq_tokens = tokens[0]
+    seq_pos_ids = position_ids[0]
+
+    # 2. Find indices where position_id resets to 0
+    # .nonzero() gives us the indices where the condition is True
+    reset_indices = (seq_pos_ids == 0).nonzero(as_tuple=False).flatten().tolist()
+
+    print_rank_0(f"Found document starts at indices: {reset_indices}")
+
+    # 3. Iterate through these resets and print context
+    context_window = 10  # How many tokens to show before/after
+
+    for idx in reset_indices:
+        # Define the slice bounds
+        start = max(0, idx - context_window)
+        end = min(len(seq_tokens), idx + context_window)
+        
+        # Slice the tensors
+        # 'pre_tokens' are the end of the previous document
+        # 'post_tokens' are the start of the new document (starting at idx)
+        pre_tokens = seq_tokens[start:idx]
+        post_tokens = seq_tokens[idx:end]
+        
+        # Decode to string
+        # We use replace('\n', '\\n') so you can see newlines in the logs clearly
+        pre_text = tok.decode(pre_tokens).replace('\n', '\\n')
+        post_text = tok.decode(post_tokens).replace('\n', '\\n')
+        
+        print_rank_0(f"--- Reset at Index {idx} ---")
+        print_rank_0(f"   End of Doc A: \"...{pre_text}\"")
+        print_rank_0(f"   Start of Doc B: \"{post_text}...\"")
+        print_rank_0("-" * 30)
+    
+    # 1. Prepare Data
+    # cu_seqlens describes the entire flattened batch. 
+    # We flatten position_ids to match the dimension of cu_seqlens.
+    flat_pos_ids = position_ids.view(-1) 
+    cu_seqlens_cpu = cu_seqlens.cpu().view(-1)
+
+    # 2. Derive expected boundaries from Position IDs (The "Ground Truth")
+    # We look for where pos_id is 0. 
+    # Note: This finds the START of every document.
+    pos_reset_indices = (flat_pos_ids == 0).nonzero(as_tuple=False).flatten().cpu()
+
+    # 3. Derive boundaries from cu_seqlens (The "Metadata")
+    # cu_seqlens is [0, len1, len1+len2, ...]. 
+    # So the starts are everything except the very last element.
+    cu_start_indices = cu_seqlens_cpu[:-1]
+
+    # 4. Compare specific Start Indices
+    print_rank_0(f"\n--- Checking cu_seqlens Consistency ---")
+    print_rank_0(f"Num documents (pos_ids): {len(pos_reset_indices)}")
+    print_rank_0(f"Num documents (cu_seq):  {len(cu_start_indices)}")
+
+    # Check if they match exactly
+    if torch.equal(pos_reset_indices, cu_start_indices):
+        print_rank_0("✅ cu_seqlens boundaries match position_ids exactly.")
+    else:
+        print_rank_0("❌ MISMATCH DETECTED!")
+        print_rank_0(f"   Pos ID Resets (first 10): {pos_reset_indices[:10].tolist()}")
+        print_rank_0(f"   Cu Seq Starts (first 10): {cu_start_indices[:10].tolist()}")
+        
+        # Identify the first mismatch index
+        min_len = min(len(pos_reset_indices), len(cu_start_indices))
+        diff = (pos_reset_indices[:min_len] != cu_start_indices[:min_len]).nonzero(as_tuple=False)
+        if diff.numel() > 0:
+            first_diff = diff[0].item()
+            print_rank_0(f"   First divergence at doc index {first_diff}:")
+            print_rank_0(f"   -> Pos ID says start is at: {pos_reset_indices[first_diff].item()}")
+            print_rank_0(f"   -> cu_seqlens says start is at: {cu_start_indices[first_diff].item()}")
+
+    # 5. Check Max Seqlen
+    # Calculate individual lengths: cu_seqlens[i+1] - cu_seqlens[i]
+    doc_lengths = cu_seqlens_cpu[1:] - cu_seqlens_cpu[:-1]
+    calculated_max = doc_lengths.max().item()
+    provided_max = max_seqlen if isinstance(max_seqlen, int) else max_seqlen.item()
+
+    print_rank_0(f"\n--- Checking max_seqlen Consistency ---")
+    print_rank_0(f"Calculated Max (from cu_seqlens): {calculated_max}")
+    print_rank_0(f"Provided Max (variable):          {provided_max}")
+
+    if calculated_max == provided_max:
+        print_rank_0("✅ max_seqlen is correct.")
+    else:
+        print_rank_0(f"❌ max_seqlen is WRONG. Diff: {provided_max - calculated_max}")
+
+    print_rank_0("-" * 30)
+
+
+def forward_step(data_iterator, model: DragonModel, return_schedule_plan: bool = False):
     """Forward training step.
 
     Args:
         data_iterator : Input data iterator
-        model (GPTModel): The GPT Model
+        model (DragonModel): The Dragon Model
         return_schedule_plan (bool): Whether to return the schedule plan instead of the output tensor
     """
     args = get_args()
@@ -142,23 +238,32 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
     global stimer
     with stimer(bdata=True):
         vp_stage = get_attr_wrapped_model(model, "vp_stage")
-        tokens, labels, loss_mask, attention_mask, position_ids = get_batch(data_iterator, vp_stage)
+        tokens, labels, loss_mask, attention_mask, position_ids, cu_seqlens, max_seqlen = get_batch(data_iterator, vp_stage)
     timers('batch-generator').stop()
+
+    #debug_batch(tokens, position_ids, cu_seqlens, max_seqlen)
+
+    packed_seq_params = None
+    if cu_seqlens is not None:
+        assert model.config.intra_doc_masking
+        cu_seqlens = cu_seqlens.squeeze(0).to(torch.int32)
+        max_seqlen = max_seqlen.item()
+        packed_seq_params = PackedSeqParams(qkv_format='thd', position_ids=position_ids.squeeze(0), cu_seqlens_q=cu_seqlens, cu_seqlens_kv=cu_seqlens, max_seqlen_q=max_seqlen, max_seqlen_kv=max_seqlen)
 
     with stimer:
         if args.use_legacy_models:
-            output_tensor = model(tokens, position_ids, attention_mask, labels=labels)
+            output_tensor = model(tokens, position_ids, attention_mask, labels=labels, packed_seq_params=packed_seq_params)
         else:
             if return_schedule_plan:
                 assert args.overlap_moe_expert_parallel_comm, \
                     "overlap_moe_expert_parallel_comm must be enabled to return the schedule plan"
                 schedule_plan = model.build_schedule_plan(
-                    tokens, position_ids, attention_mask, labels=labels, loss_mask=loss_mask
+                    tokens, position_ids, attention_mask, labels=labels, loss_mask=loss_mask, packed_seq_params=packed_seq_params,
                 )
                 return schedule_plan, partial(loss_func, loss_mask, model=model)
             else:
                 output_tensor = model(
-                    tokens, position_ids, attention_mask, labels=labels, loss_mask=loss_mask
+                    tokens, position_ids, attention_mask, labels=labels, loss_mask=loss_mask, packed_seq_params=packed_seq_params,
                 )
 
     # [ModelOpt]: model is needed to access ModelOpt distillation losses
@@ -167,7 +272,7 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
 
 def is_dataset_built_on_rank(vp_stage=None):
     args = get_args()
-    config = core_transformer_config_from_args(args)
+    config = core_transformer_config_from_args(args, config_class=DragonConfig)
     return (
         is_first_or_last_pipeline_stage(vp_stage)
         or mtp_on_this_rank(config, ignore_virtual=False, vp_stage=vp_stage)
@@ -185,6 +290,9 @@ def core_gpt_dataset_config_from_args(args):
     blend_per_split: Optional[List[Optional[Tuple[List[str], Optional[List[float]]]]]]
     blend, blend_per_split = get_blend_and_blend_per_split(args)
 
+    if args.create_cu_seqlens_in_dataloader:
+        assert not args.eod_mask_loss, "we don't want to mask the loss of the first sequence!"
+
     return GPTDatasetConfig(
         random_seed=args.seed,
         sequence_length=args.seq_length,
@@ -201,6 +309,7 @@ def core_gpt_dataset_config_from_args(args):
         reset_attention_mask=args.reset_attention_mask,
         eod_mask_loss=args.eod_mask_loss,
         create_attention_mask=args.create_attention_mask_in_dataloader,
+        create_cu_seqlens=args.create_cu_seqlens_in_dataloader,
         object_storage_cache_path=args.object_storage_cache_path,
         mid_level_dataset_surplus=args.mid_level_dataset_surplus,
         allow_ambiguous_pad_tokens=args.allow_ambiguous_pad_tokens,
@@ -262,7 +371,7 @@ if __name__ == "__main__":
 
     pretrain(
         train_valid_test_datasets_provider,
-        partial(model_provider, gpt_builder),
+        partial(model_provider, dragon_builder),
         ModelType.encoder_or_decoder,
         forward_step,
         args_defaults={'tokenizer_type': 'GPT2BPETokenizer'},

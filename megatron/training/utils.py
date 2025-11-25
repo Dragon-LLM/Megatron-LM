@@ -324,6 +324,7 @@ def get_ltor_masks_and_position_ids(data,
                                     eod_mask_loss,
                                     pad_mask_loss):
     """Build masks and position id for left to right model."""
+    assert False, "we shouldnt be here. See megatron/core/datasets/gpt_dataset.py for edits to update this function."
 
     # Extract batch size and sequence length.
     micro_batch_size, seq_length = data.size()
@@ -516,6 +517,47 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
                 group=mpu.get_tensor_model_parallel_group(),
             )
 
+    def _broadcast_cu_seqlens_and_max(cu_seqlens, max_seqlen):
+        """Broadcast cu_seqlens (1, Nseq) and max_seqlen (1,) from TP src rank.
+
+        On src rank, cu_seqlens / max_seqlen are real tensors.
+        On other ranks, they are None and will be allocated inside.
+        """
+        src = mpu.get_tensor_model_parallel_src_rank()
+        group = mpu.get_tensor_model_parallel_group()
+        device = torch.cuda.current_device()
+
+        # 1) broadcast Nseq (second dim of cu_seqlens)
+        if cu_seqlens is not None:
+            # src rank
+            nseq = torch.tensor([cu_seqlens.size(1)],
+                                device=cu_seqlens.device,
+                                dtype=torch.int64)
+        else:
+            nseq = torch.empty(1, device=device, dtype=torch.int64)
+        torch.distributed.broadcast(nseq, src, group)
+        nseq = int(nseq.item())
+
+        # 2) allocate cu_seqlens on non-src ranks, then broadcast contents
+        if cu_seqlens is None:
+            cu_seqlens = torch.empty(
+                (1, nseq),
+                dtype=torch.int64,
+                device=device,
+            )
+        torch.distributed.broadcast(cu_seqlens, src, group)
+
+        # 3) max_seqlen is just (1,), broadcast as usual
+        if max_seqlen is None:
+            max_seqlen = torch.empty(
+                (1,),
+                dtype=torch.int64,
+                device=device,
+            )
+        torch.distributed.broadcast(max_seqlen, src, group)
+
+        return cu_seqlens, max_seqlen
+
     if mpu.get_tensor_model_parallel_rank() == 0:
 
         assert data_iterator is not None
@@ -530,6 +572,16 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
                 else data["attention_mask"].cuda(non_blocking=True)
             ),
             'position_ids': data["position_ids"].cuda(non_blocking=True),
+            'cu_seqlens': (
+                None
+                if "cu_seqlens" not in data
+                else data["cu_seqlens"].cuda(non_blocking=True)
+            ),
+            'max_seqlen': (
+                None
+                if "max_seqlen" not in data
+                else data["max_seqlen"].cuda(non_blocking=True)
+            ),
         }
 
         if args.pipeline_model_parallel_size == 1 or mtp_on_this_rank:
@@ -538,11 +590,19 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
             _broadcast(batch['loss_mask'])
             _broadcast(batch['attention_mask'])
             _broadcast(batch['position_ids'])
+            if args.create_cu_seqlens_in_dataloader:
+                batch['cu_seqlens'], batch['max_seqlen'] = _broadcast_cu_seqlens_and_max(
+                    batch['cu_seqlens'], batch['max_seqlen']
+                )
 
         elif mpu.is_pipeline_first_stage():
             _broadcast(batch['tokens'])
             _broadcast(batch['attention_mask'])
             _broadcast(batch['position_ids'])
+            if args.create_cu_seqlens_in_dataloader:
+                batch['cu_seqlens'], batch['max_seqlen'] = _broadcast_cu_seqlens_and_max(
+                    batch['cu_seqlens'], batch['max_seqlen']
+                )
 
         elif mpu.is_pipeline_last_stage():
             # Multi-Token Prediction (MTP) layers need tokens and position_ids to calculate embedding.
@@ -551,6 +611,10 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
             _broadcast(batch['labels'])
             _broadcast(batch['loss_mask'])
             _broadcast(batch['attention_mask'])
+            if args.create_cu_seqlens_in_dataloader:
+                batch['cu_seqlens'], batch['max_seqlen'] = _broadcast_cu_seqlens_and_max(
+                    batch['cu_seqlens'], batch['max_seqlen']
+                )
 
     else:
 
@@ -582,6 +646,8 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
             dtype=torch.int64,
             device=torch.cuda.current_device(),
         )
+        cu_seqlens = None
+        max_seqlen = None
 
         if args.pipeline_model_parallel_size == 1 or mtp_on_this_rank:
             _broadcast(tokens)
@@ -589,6 +655,10 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
             _broadcast(loss_mask)
             _broadcast(attention_mask)
             _broadcast(position_ids)
+            if args.create_cu_seqlens_in_dataloader:
+                cu_seqlens, max_seqlen = _broadcast_cu_seqlens_and_max(
+                    cu_seqlens, max_seqlen
+                )
 
         elif mpu.is_pipeline_first_stage():
             labels = None
@@ -597,6 +667,10 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
             _broadcast(tokens)
             _broadcast(attention_mask)
             _broadcast(position_ids)
+            if args.create_cu_seqlens_in_dataloader:
+                cu_seqlens, max_seqlen = _broadcast_cu_seqlens_and_max(
+                    cu_seqlens, max_seqlen
+                )
 
         elif mpu.is_pipeline_last_stage():
             # Multi-Token Prediction (MTP) layers need tokens and position_ids to calculate embedding.
@@ -608,6 +682,10 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
             _broadcast(labels)
             _broadcast(loss_mask)
             _broadcast(attention_mask)
+            if args.create_cu_seqlens_in_dataloader:
+                cu_seqlens, max_seqlen = _broadcast_cu_seqlens_and_max(
+                    cu_seqlens, max_seqlen
+                )
 
         batch = {
             'tokens': tokens,
@@ -615,6 +693,8 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
             'loss_mask': loss_mask,
             'attention_mask': attention_mask,
             'position_ids': position_ids,
+            'cu_seqlens': cu_seqlens,
+            'max_seqlen': max_seqlen,
         }
 
     return batch

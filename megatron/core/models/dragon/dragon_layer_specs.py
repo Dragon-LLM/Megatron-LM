@@ -30,6 +30,7 @@ from megatron.core.dragon.dragon_block import (
 )
 from megatron.core.dragon.dragon_attention import SelfDiffAttention, SelfDiffAttentionSubmodules
 from megatron.core.dragon.dragon_gated_delta_net import GatedDeltaNet, GatedDeltaNetSubmodules
+from megatron.core.transformer.mlp import MLP, MLPSubmodules
 from megatron.core.transformer.moe.moe_layer import MoELayer, MoESubmodules
 from megatron.core.transformer.moe.experts import TEGroupedMLP
 from megatron.core.transformer.moe.shared_experts import SharedExpertMLP
@@ -79,12 +80,11 @@ except ImportError:
 from megatron.core.extensions.transformer_engine import TELinear, TELayerNormColumnParallelLinear, TEColumnParallelLinear, TERowParallelLinear,TEDotProductAttention, TEColumnParallelGroupedLinear, TERowParallelGroupedLinear
 
 def get_dragon_block_spec(
-        layers_config: str,
-        intra_doc_masking: bool = False,
+    config: DragonConfig,
 ):
     attention = ModuleSpec(
         module=SelfDiffAttention,
-        params={"attn_mask_type": AttnMaskType.causal if not intra_doc_masking else AttnMaskType.padding_causal},
+        params={"attn_mask_type": AttnMaskType.causal if not config.intra_doc_masking else AttnMaskType.padding_causal},
         submodules=SelfDiffAttentionSubmodules(
             linear_in=TELayerNormColumnParallelLinear,
             linear_BkBv=TELinear,
@@ -99,29 +99,39 @@ def get_dragon_block_spec(
             in_proj=TELayerNormColumnParallelLinear,
         )
     )
-    experts = ModuleSpec(
-        module=TEGroupedMLP,
-        submodules=MLPSubmodules(
-            linear_fc1=TEColumnParallelGroupedLinear,
-            linear_fc2=TERowParallelGroupedLinear,
-        ),
-    )
-    shared_experts = ModuleSpec(
-        module=SharedExpertMLP,
-        submodules=MLPSubmodules(
-            linear_fc1=TEColumnParallelLinear, # no layernorm. it's done as a standalone.
-            linear_fc2=TERowParallelLinear,
-            activation_func=squared_relu,
-        ),
-    )
-    mlp = ModuleSpec(
-        module=MoELayer,
-        params={},
-        submodules=MoESubmodules(
-            experts=experts,
-            shared_experts=shared_experts,
+    if config.num_moe_experts is None or config.num_moe_experts == 0:
+        mlp = ModuleSpec(
+            module=MLP,
+            submodules=MLPSubmodules(
+                linear_fc1=TEColumnParallelLinear, # no layernorm. it's done as a standalone.
+                linear_fc2=TERowParallelLinear,
+                activation_func=squared_relu,
+            ),
         )
-    )
+    else:
+        experts = ModuleSpec(
+            module=TEGroupedMLP,
+            submodules=MLPSubmodules(
+                linear_fc1=TEColumnParallelGroupedLinear, # no layernorm. it's done as a standalone.
+                linear_fc2=TERowParallelGroupedLinear,
+            ),
+        )
+        shared_experts = ModuleSpec(
+            module=SharedExpertMLP,
+            submodules=MLPSubmodules(
+                linear_fc1=TEColumnParallelLinear, # no layernorm. it's done as a standalone.
+                linear_fc2=TERowParallelLinear,
+                activation_func=squared_relu,
+            ),
+        )
+        mlp = ModuleSpec(
+            module=MoELayer,
+            params={},
+            submodules=MoESubmodules(
+                experts=experts,
+                shared_experts=shared_experts,
+            )
+        )
     layer = ModuleSpec(
         module=DragonLayer,
         params={},
@@ -135,7 +145,7 @@ def get_dragon_block_spec(
         ),
     )
     dragon_block_spec = DragonBlockSubmodules(
-        layer_specs=[layer] * len(layers_config),
+        layer_specs=[layer] * len(config.layers_config),
         final_layer_norm=TENorm,
     )
 

@@ -16,6 +16,10 @@ from megatron.training import get_args, print_rank_0
 from megatron.training.arguments import core_transformer_config_from_args
 from megatron.training.yaml_arguments import core_transformer_config_from_yaml
 
+from megatron.core.models.dragon import DragonModel
+from megatron.core.dragon.dragon_config import DragonConfig
+from megatron.core.models.dragon.dragon_layer_specs import get_dragon_block_spec
+
 import megatron.legacy.model  # isort: skip
 
 # NOTE: Loading `megatron.legacy.model` earlier fails due to circular import
@@ -130,3 +134,38 @@ def _get_transformer_layer_spec(use_te, config):
             normalization=args.normalization,
             use_kitchen=config.use_kitchen,
         )
+
+
+def dragon_builder(args, pre_process, post_process, vp_stage=None, config=None):
+    print_rank_0('building Dragon model ...')
+    if config is None:
+        if args.yaml_cfg is not None:
+            assert False, "YAML config not supported for DragonModel."
+            config = core_transformer_config_from_yaml(args, "language_model")
+        else:
+            config = core_transformer_config_from_args(args, config_class=DragonConfig)
+
+    print_rank_0(f'Dragon config: {config}')
+
+    model = DragonModel(
+        config=config,
+        dragon_layer_spec=get_dragon_block_spec(config),
+        vocab_size=args.padded_vocab_size,
+        max_sequence_length=args.max_position_embeddings,
+        pre_process=pre_process,
+        post_process=post_process,
+        fp16_lm_cross_entropy=args.fp16_lm_cross_entropy,
+        parallel_output=True,
+        share_embeddings_and_output_weights=not args.untie_embeddings_and_output_weights,
+        position_embedding_type=args.position_embedding_type,
+        rotary_percent=args.rotary_percent,
+        rotary_base=args.rotary_base,
+        rope_scaling=args.use_rope_scaling,
+        mtp_block_spec=None,
+        vp_stage=vp_stage,
+    )
+
+    num_params = sum([p.nelement() for p in model.parameters()])
+    print_rank_0(f'Dragon model parameters: {num_params:,}')
+
+    return model

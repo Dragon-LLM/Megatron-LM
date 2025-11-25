@@ -50,8 +50,8 @@ class DragonConfig(ModelParallelConfig):
     num_layers: int = 0
     """Number of Dragon layers in a Dragon block."""
 
-    num_attention_layers: int = 0
-    """Number of Dragon attentions layers in a Dragon block."""
+    #num_attention_layers: int = 0
+    #"""Number of Dragon attentions layers in a Dragon block."""
 
     mtp_num_layers: Optional[int] = None
     """Number of Multi-Token Prediction (MTP) Layers."""
@@ -272,7 +272,7 @@ class DragonConfig(ModelParallelConfig):
     ####################
     init_std: float = 1.0
 
-    init_output_std: float = 1.0
+    init_output_std: Optional[float] = None
 
     init_embedding_std: Optional[float] = None
 
@@ -841,9 +841,6 @@ class DragonConfig(ModelParallelConfig):
                 f"linear_attention_type ({self.linear_attention_type}) only support"
                 f" one of {supported_la_types}."
             )
-            assert (
-                self.linear_attention_freq is not None
-            ), f"linear_attention_freq must be set for linear attention."
 
             if self.linear_attention_type == "gated_delta_net":
                 # Check required parameters
@@ -1430,9 +1427,9 @@ class DragonConfig(ModelParallelConfig):
         if self.multi_latent_attention and self.rotary_interleaved:
             raise ValueError("rotary_interleaved does not work with multi_latent_attention.")
 
-        self.embedding_init_method = init_method_normal(self.init_embedding_std)
+        self.embedding_init_method = init_method_normal(self.init_embedding_std if self.init_embedding_std else self.init_std)
         self.init_method = init_method_normal(self.init_std)
-        self.output_layer_init_method = init_method_normal(self.init_output_std)
+        self.output_layer_init_method = init_method_normal(self.init_output_std if self.init_output_std else self.init_std)
 
         if self.num_moe_experts is not None and self.add_bias_linear:
             assert (

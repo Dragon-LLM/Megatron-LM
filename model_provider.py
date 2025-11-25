@@ -8,6 +8,7 @@ import torch
 
 from megatron.core.models.gpt import GPTModel
 from megatron.core.models.mamba import MambaModel
+from megatron.core.models.dragon import DragonModel
 from megatron.training import get_args, print_rank_0
 
 try:
@@ -24,7 +25,7 @@ import megatron.legacy.model  # isort: skip
 
 def model_provider(
     model_builder: Callable, pre_process=True, post_process=True, vp_stage: Optional[int] = None
-) -> Union[GPTModel, megatron.legacy.model.GPTModel, MambaModel]:
+) -> Union[GPTModel, megatron.legacy.model.GPTModel, MambaModel, DragonModel]:
     """Builds the model.
 
     If you set the use_legacy_models to True, it will return the legacy GPT model and if not the mcore GPT model.

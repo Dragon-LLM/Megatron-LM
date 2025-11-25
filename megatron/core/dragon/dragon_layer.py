@@ -421,7 +421,7 @@ class DragonLayer(GraphableMegatronModule, BaseDragonLayer):
         kwargs.pop("dynamic_inference_decode_only", None)
         residual, y_mixer = self._forward_mixer(*args, **kwargs) # (L, B, H, D)
         y_mixer = self._torch_compiled_headwise_norm(y_mixer)
-        y_mixer = y_mixer.view(y_mixer.size(0), y_mixer.size(1), -1).float() # (L, B, H*D) # TODO TEMP: float
+        y_mixer = y_mixer.view(y_mixer.size(0), y_mixer.size(1), -1) # (L, B, H*D)
         nvtx_range_push(suffix="mixer_proj")
         if self.offload_mixer_proj:
             y_mixer = fine_grained_offloading_group_start(y_mixer, name="mixer_proj")

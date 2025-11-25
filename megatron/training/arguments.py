@@ -53,6 +53,7 @@ def add_megatron_arguments(parser: argparse.ArgumentParser):
 
     # Standard arguments.
     parser = _add_network_size_args(parser)
+    parser = _add_dragon_args(parser)
     parser = _add_regularization_args(parser)
     parser = _add_training_args(parser)
     parser = _add_rl_args(parser)
@@ -1722,6 +1723,25 @@ def _add_network_size_args(parser):
                        'which serves as an additional training objective.')
     return parser
 
+def _add_dragon_args(parser):
+    group = parser.add_argument_group(title='dragon')
+    group.add_argument('--is-dragon-model', action='store_true')
+    group.add_argument('--use-uscaling', action='store_true')
+    group.add_argument('--uscaling-tau', type=float, default=0.2)
+    #group.add_argument('--num-attention-layers', type=int, default=4)
+    group.add_argument('--layers-config', type=str, default='dddTddd')
+    group.add_argument('--num-signal-heads', type=int, default=12)
+    group.add_argument('--tpa-rank', type=int, default=4)
+    group.add_argument('--token-shift', action='store_true')
+    group.add_argument('--gate-attn', action='store_true')
+    group.add_argument('--gate-gdn', action='store_true')
+    group.add_argument('--softcap-attn', type=float, default=0.)
+    group.add_argument('--scalable-softmax', action='store_true')
+    # p-state-passing, not implemented yet
+    group.add_argument('--intra-doc-masking', action='store_true')
+    group.add_argument('--training-sequence-length', type=int, default=2048)
+
+    return parser
 
 def _add_straggler_detector_args(parser):
     group = parser.add_argument_group(title='straggler')
@@ -2960,6 +2980,8 @@ def _add_data_args(parser):
     group.add_argument('--no-create-attention-mask-in-dataloader', action='store_false',
                        help='If set, do not create attention_masks in dataloader.',
                        dest='create_attention_mask_in_dataloader')
+    group.add_argument('--create-cu-seqlens-in-dataloader', action='store_true',
+                       help='If set, create cu_seqlens in dataloader.')
     group.add_argument('--num-dataset-builder-threads', type=int, default=1,
                        help='Number of parallel threads per rank for dataset builder')
     group.add_argument('--object-storage-cache-path', type=str, default=None,
