@@ -196,8 +196,8 @@ class GatedDeltaNet(MegatronModule):
     def reset_parameters(self):
         """Reset the parameters."""
         if self.config.perform_initialization:
-            #with get_cuda_rng_tracker().fork():
-            with nullcontext(): # TODO TEMP
+            with get_cuda_rng_tracker().fork():
+            #with nullcontext(): # TEMP
                 # conv1d.weight
                 if self.conv_init is not None:
                     nn.init.uniform_(self.conv1d.weight, -self.conv_init, self.conv_init)

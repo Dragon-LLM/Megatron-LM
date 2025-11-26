@@ -1164,6 +1164,13 @@ def get_optimizer_param_scheduler(optimizer):
         slw_end=args.seq_length,
         slw_increment=args.slw_increment,
         global_batch_size=args.global_batch_size,
+        optim=args.optimizer,
+        beta1=args.adam_beta1,
+        beta2=args.adam_beta2,
+        beta3=args.ademamix_beta3,
+        alpha=args.ademamix_alpha,
+        beta3_warmup_steps=args.ademamix_beta3_warmup_steps if args.ademamix_beta3_warmup_steps is not None else args.train_iters,
+        alpha_warmup_steps=args.ademamix_alpha_warmup_steps if args.ademamix_alpha_warmup_steps is not None else args.train_iters,
         use_checkpoint_opt_param_scheduler=args.use_checkpoint_opt_param_scheduler,
         override_opt_param_scheduler=args.override_opt_param_scheduler,
         wsd_decay_steps=wsd_decay_steps,
@@ -1495,6 +1502,8 @@ def training_log(
     learning_rate,
     decoupled_learning_rate,
     wsize,
+    beta3,
+    alpha,
     iteration,
     loss_scale,
     report_memory_flag,
@@ -1597,6 +1606,14 @@ def training_log(
         writer.add_scalar('wsize vs samples', wsize, args.consumed_train_samples)
         if wandb_writer:
             wandb_writer.log({'wsize': wsize}, iteration)
+        writer.add_scalar('beta3', beta3, iteration)
+        writer.add_scalar('beta3 vs samples', beta3, args.consumed_train_samples)
+        if wandb_writer:
+            wandb_writer.log({'beta3': beta3}, iteration)
+        writer.add_scalar('alpha', alpha, iteration)
+        writer.add_scalar('alpha vs samples', alpha, args.consumed_train_samples)
+        if wandb_writer:
+            wandb_writer.log({'alpha': alpha}, iteration)
         if args.decoupled_lr is not None:
             writer.add_scalar('decoupled-learning-rate', decoupled_learning_rate, iteration)
         if args.skipped_train_samples > 0:
@@ -1745,6 +1762,8 @@ def training_log(
         # Decoupled_learning_rate should be not None only on first and last pipeline stage.
         log_string += f' learning rate: {learning_rate:.6E} |'
         log_string += f' wsize: {wsize} |'
+        log_string += f' beta3: {beta3:.6f} |'
+        log_string += f' alpha: {alpha:.6f} |'
         if args.decoupled_lr is not None and (
             mpu.is_pipeline_first_stage(ignore_virtual=True)
             or mpu.is_pipeline_last_stage(ignore_virtual=True)
@@ -2524,6 +2543,8 @@ def train(
             learning_rate,
             decoupled_learning_rate,
             opt_param_scheduler.get_wsize(),
+            opt_param_scheduler.get_beta3(),
+            opt_param_scheduler.get_alpha(),
             iteration,
             loss_scale,
             report_memory_flag,

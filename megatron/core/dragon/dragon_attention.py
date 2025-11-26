@@ -179,8 +179,8 @@ class DiffAttention(MegatronModule, ABC):
 
         # Diff attention scalers
         self.lambda_init = 0.8 - 0.6 * math.exp(-0.3 * layer_number)
-        #with get_cuda_rng_tracker().fork():
-        with nullcontext(): # TODO TEMP
+        with get_cuda_rng_tracker().fork():
+        #with nullcontext(): # TEMP
             head_dim = self.hidden_size_per_attention_head // 2
             self.lambda_q1 = torch.nn.Parameter(torch.zeros(head_dim, dtype=torch.float32).normal_(mean=0,std=0.1))
             self.lambda_k1 = torch.nn.Parameter(torch.zeros(head_dim, dtype=torch.float32).normal_(mean=0,std=0.1))
@@ -1084,7 +1084,7 @@ class DiffAttention(MegatronModule, ABC):
 
         return core_attn_out
 
-    #@torch.compile # TODO: reactive. it's disabled during tests
+    @torch.compile # TODO: reactive. it's disabled during tests
     def _torch_compiled_token_shift(self, key, value, alpha_k, alpha_v, position_ids=None):
         alpha_k = torch.sigmoid(alpha_k.float()).float().to(key.dtype) # (L, B, H_local, 1)
         alpha_v = torch.sigmoid(alpha_v.float()).float().to(value.dtype) # (L, B, H_noise_local, 1)
@@ -1107,7 +1107,7 @@ class DiffAttention(MegatronModule, ABC):
 
         return key, value
 
-    #@torch.compile # TODO: reactive. it's disabled during tests
+    @torch.compile # TODO: reactive. it's disabled during tests
     def _torch_compiled_output_gate(self, x, gate):
         x_dtype = x.dtype
         gate = gate.contiguous().view(*x.shape)

@@ -16,7 +16,7 @@ class OptimizerConfig:
     # General
     ##############
     optimizer: str = 'adam'
-    """Optimizer to use (one of Adam, SGD, or Muon)."""
+    """Optimizer to use (one of Adam, SGD, or Muon, Ademamix)."""
 
     lr: Optional[float] = None
     """Initial learning rate. Depending on decay style and initial warmup, the learning rate at each
@@ -128,6 +128,11 @@ class OptimizerConfig:
     """If true, decouples weight decay from the gradient update, equivalent to AdamW. If false,
     original Adam update rule will be used. Defaults to True.
     """
+
+    # Ademamix
+    ademamix_beta3: float = 0.9999
+
+    ademamix_alpha: float = 8.0
 
     # SGD.
     sgd_momentum: float = 0.9

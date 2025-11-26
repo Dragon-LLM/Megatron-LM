@@ -10,6 +10,7 @@ from torch.optim import AdamW as CPUAdam
 
 try:
     from transformer_engine.pytorch.optimizers import FusedAdam as Adam
+    from transformer_engine.pytorch.optimizers import FusedAdemamix as Ademamix
     from transformer_engine.pytorch.optimizers import FusedSGD as SGD
 
     USING_PYTORCH_OPTIMIZER = False
@@ -17,6 +18,7 @@ except ImportError:
     try:
         from apex.optimizers import FusedAdam as Adam
         from apex.optimizers import FusedSGD as SGD
+        Ademamix = None
 
         USING_PYTORCH_OPTIMIZER = False
     except ImportError:
@@ -29,6 +31,7 @@ except ImportError:
         # See https://github.com/NVIDIA/apex/blob/7b73b12361068a10b0f44844534613f252a5ea75/apex/optimizers/fused_adam.py#L16.
         from torch.optim import SGD
         from torch.optim import AdamW as Adam
+        Ademamix = None
 
         USING_PYTORCH_OPTIMIZER = True
 
@@ -458,6 +461,7 @@ def _get_megatron_optimizer_based_on_param_groups(
     # for the purposes of grad stats reductions
     if param_groups:
         if config.optimizer_cpu_offload:
+            assert config.optimizer != 'ademamix'
             if torch.__version__ < '2.3.0':
                 warnings.warn(
                     "CPU offload is recommended for PyTorch >= 2.3.0, "
@@ -548,6 +552,53 @@ def _get_megatron_optimizer_based_on_param_groups(
                         if len(opt.state[p]) == 0:
                             if config is None or not config.use_precision_aware_optimizer:
                                 opt.state[p]['exp_avg'] = torch.zeros_like(p.data)
+                                opt.state[p]['exp_avg_sq'] = torch.zeros_like(p.data)
+                            else:
+                                opt.initialize_state(p)
+        
+        elif config.optimizer == 'ademamix':
+            kwargs = {
+                "params": param_groups,
+                "lr": config.lr,
+                "weight_decay": config.weight_decay,
+                "betas": (config.adam_beta1, config.adam_beta2, config.ademamix_beta3),
+                "alpha": config.ademamix_alpha,
+                "eps": config.adam_eps,
+            }
+
+            if config.use_precision_aware_optimizer:
+                kwargs.update(
+                    {
+                        "exp_avg_dtype": config.exp_avg_dtype,
+                        "exp_avg_sq_dtype": config.exp_avg_sq_dtype,
+                    }
+                )
+                # Master weight is managed by MCore when main_params_dtype is fp32. This is
+                # because we want to use fp8 primary weight with precision aware optimizer.
+                # Otherwise, master weight will be managed by TransformerEngine.
+                # Delayed scaling is an exception because casting as well as the computation
+                # of the scaling factor can be conducted in the adam kernel.
+                if config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
+                    kwargs.update(
+                        {
+                            "master_weights": True,
+                            "use_decoupled_grad": True,
+                            "master_weight_dtype": config.main_params_dtype,
+                        }
+                    )
+
+                if is_te_min_version("2.1.0.dev0"):
+                    kwargs.update({"store_param_remainders": config.store_param_remainders})
+
+            optimizer = Ademamix(**kwargs)
+
+            def init_state_fn(opt, config=None):
+                for group in opt.param_groups:
+                    for p in group['params']:
+                        if len(opt.state[p]) == 0:
+                            if config is None or not config.use_precision_aware_optimizer:
+                                opt.state[p]['exp_avg'] = torch.zeros_like(p.data)
+                                opt.state[p]['exp_avg_slow'] = torch.zeros_like(p.data)
                                 opt.state[p]['exp_avg_sq'] = torch.zeros_like(p.data)
                             else:
                                 opt.initialize_state(p)

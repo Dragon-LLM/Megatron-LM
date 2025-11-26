@@ -1973,6 +1973,14 @@ def _add_regularization_args(parser):
     group.add_argument('--adam-beta2', type=float, default=0.999,
                        help='Second coefficient for computing running averages '
                        'of gradient and its square')
+    group.add_argument('--ademamix-beta3', type=float, default=0.9999,
+                       help='Coefficient for computing slow first moment')
+    group.add_argument('--ademamix-alpha', type=float, default=8.0,
+                       help='Scaling factor for the slow term')
+    group.add_argument('--ademamix-beta3-warmup-steps', type=int, default=None,
+                       help='Number of warmup steps for beta3')
+    group.add_argument('--ademamix-alpha-warmup-steps', type=int, default=None,
+                       help='Number of warmup steps for alpha')
     group.add_argument('--adam-eps', type=float, default=1e-08,
                        help='Term added to the denominator to improve'
                        'numerical stability')
@@ -2295,7 +2303,7 @@ def _add_training_args(parser):
                        help='Enable bias only in the QKV linear layers',
                        dest='add_qkv_bias')
     group.add_argument('--optimizer', type=str, default='adam',
-                       choices=['adam', 'sgd', 'muon', 'dist_muon'],
+                       choices=['adam', 'sgd', 'muon', 'dist_muon', 'ademamix'],
                        help='Optimizer function')
     group.add_argument('--optimizer-cpu-offload', action='store_true',
                        help='Offload optimizer state to CPU')
