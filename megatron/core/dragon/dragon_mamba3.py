@@ -29,18 +29,10 @@ from megatron.core.transformer.utils import (
 )
 from megatron.core.utils import deprecate_inference_params, log_single_rank
 
-from .mamba_context_parallel import MambaContextParallel
-
 try:
-    from mamba_ssm.ops.triton.selective_state_update import selective_state_update
-except ImportError:
-    selective_state_update = None
-
-try:
-    from causal_conv1d import causal_conv1d_fn, causal_conv1d_update
+    from causal_conv1d import causal_conv1d_fn
 except ImportError:
     causal_conv1d_fn = None
-    causal_conv1d_update = None
 
 try:
     from mamba_ssm.ops.triton.layernorm_gated import RMSNorm as RMSNormGated
@@ -288,7 +280,6 @@ class MambaMixer(MegatronModule):
                 nn.init.uniform_(self.conv1d.weight, -self.conv_init, self.conv_init)
 
         self.activation = "silu"
-        self.act = nn.SiLU()
 
         with get_cuda_rng_tracker().fork():
             # Initialize dt bias so that F.softplus(dt_bias) is between dt_min and dt_max
@@ -344,39 +335,7 @@ class MambaMixer(MegatronModule):
                 dtype=config.params_dtype,
             )
 
-        # Assume sequence parallelism: input is partitioned along d_inner and
-        # output is partitioned along the sequence dimension
-        self.out_proj = build_module(
-            submodules.out_proj,
-            self.d_inner,
-            self.d_model,
-            config=self.config,
-            init_method=self.config.output_layer_init_method,
-            bias=bias,
-            input_is_parallel=True,
-            skip_bias_add=True,
-            is_expert=False,
-            tp_comm_buffer_name="fc2",
-            tp_group=self.pg_collection.tp,
-        )
-
-        # Regarding `conv1d`.{`weight`, `bias`}, `dt_bias`, `A_log`, and `D`: these are the
-        # trainable variables for the current tensor parallel rank, with each tensor parallel rank
-        # having indepdendent trainable variables. All context parallel ranks in a tensor parallel
-        # rank store the same trainable variables, but only use and update their unique/independent
-        # slice of them.
-        self.cp = MambaContextParallel(
-            cp_group=self.pg_collection.cp,
-            d_inner_local_tp=self.d_inner_local_tp,
-            nheads_local_tp=self.nheads_local_tp,
-            ngroups_local_tp=self.ngroups_local_tp,
-            d_state=self.d_state,
-            conv1d_cp1=self.conv1d,
-            dt_bias_cp1=self.dt_bias,
-            A_log_cp1=self.A_log,
-            D_cp1=self.D,
-            D_has_hdim=self.D_has_hdim,
-        )
+        # todo: out_proj: self.d_inner -> self.d_model
 
     def forward(
         self,
@@ -391,76 +350,14 @@ class MambaMixer(MegatronModule):
         """
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
-
-        _, batch, dim = hidden_states.shape
-
-        conv_state, ssm_state = None, None
-
         in_inference_mode = inference_context is not None and not self.training
-        if in_inference_mode:
-            if inference_context.is_dynamic_batching():
-                return self.dynamic_inference(hidden_states, inference_context)
-            else:
-                assert inference_context.is_static_batching()
-                assert not self.config.sequence_parallel
-                conv_state, ssm_state = self._get_states_from_cache(inference_context, batch)
-                if inference_context.seqlen_offset > 0:
-                    # The states are updated inplace
-                    out, out_bias = self.decode(hidden_states, conv_state, ssm_state)
-                    return out, out_bias
+        assert not in_inference_mode
 
         zxBCdt, _ = self.in_proj(hidden_states)
-
-        zxBCdt = self.cp.pre_conv_ssm(zxBCdt)
-
-        if in_inference_mode or not self.use_mem_eff_path:
-            # TODO(ksanthanam): Consider deprecating this path for training
-            y = self.ssm_prefill(zxBCdt, conv_state=conv_state, ssm_state=ssm_state)
-        else:
-            assert ssm_state is None
-            y = self.ssm_training(zxBCdt)
-
-        out, out_bias = self.out_proj(y)
-
-        return out, out_bias
-
-    def dynamic_inference(
-        self, hidden_states, inference_context: DynamicInferenceContext
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Runs inference computation for dynamic batching."""
-        raise NotImplementedError(f"Dynamic inference is not supported.")
-
-    def decode(self, hidden_states, conv_state, ssm_state) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Performs inference step for decoding."""
-        # assert self.ngroups_local_tp == 1, "Only support ngroups=1 for inference for now"
-        dtype = hidden_states.dtype
-        assert hidden_states.shape[0] == 1, "Only support decoding with 1 token at a time for now"
-
-        #  b d_model --> b p(2d)
-        zxBCdt, _ = self.in_proj(hidden_states)
-
-        assert self.cp.cp_size == 1, "Context parallel not supported for Mamba inferenece decode"
-
-        y = self.ssm_decode(zxBCdt, conv_state=conv_state, ssm_state=ssm_state)
-
-        # l b pd --> l b d
-        out, out_bias = self.out_proj(y)
-        return out, out_bias
-
-    def ssm_training(self, zxBCdt: torch.Tensor) -> torch.Tensor:
-        """
-        Performs SSM computation for training step.
-
-        Uses the memory-efficient kernel `mamba_split_conv1d_scan_combined` which reduces the size
-        of forward activations stored for backprop and therefore reduces memory pressure during
-        training.
-        """
 
         # transpose: l b pd --> b l pd
         zxBCdt = rearrange(zxBCdt, "l b d -> b l d").contiguous()
-
-        # (nheads_local_tpcp)
-        A = -torch.exp(self.cp.get_A_log().float())
+        A = -torch.exp(self.A_log.float())
 
         # TODO(duncan): Can this code be removed?
         if self.conv1d.bias is not None:
@@ -468,323 +365,30 @@ class MambaMixer(MegatronModule):
 
         y = mamba_split_conv1d_scan_combined(
             zxBCdt,
-            rearrange(self.cp.get_conv1d_weight(), "d 1 w -> d w"),
-            self.cp.get_conv1d_bias(),
-            self.cp.get_dt_bias().float(),
+            rearrange(self.conv1d.weight, "d 1 w -> d w"),
+            self.conv1d.bias,
+            self.dt_bias.float(),
             A,
             D=(
-                rearrange(self.cp.get_D().float(), "(h p) -> h p", p=self.headdim)
+                rearrange(self.D.float(), "(h p) -> h p", p=self.headdim)
                 if self.D_has_hdim
-                else self.cp.get_D()
+                else self.D
             ),
             chunk_size=self.chunk_size,
             activation=self.activation,
             headdim=None if self.D_has_hdim else self.headdim,
-            ngroups=self.cp.ngroups_local_tpcp,
+            ngroups=self.ngroups_local_tp,
             norm_before_gate=self.norm_before_gate,
         )
 
         y = rearrange(y, "b l d -> l b d").contiguous()
-        y = self.cp.post_conv_ssm(y)
 
         if self.rmsnorm:
             y = self.norm(y)
 
-        return y
+        out, out_bias = self.out_proj(y)
 
-    def ssm_prefill(
-        self,
-        zxBCdt: torch.Tensor,
-        conv_state: Optional[torch.Tensor],
-        ssm_state: Optional[torch.Tensor],
-    ) -> torch.Tensor:
-        """Performs SSM computation for inference prefill step."""
-
-        # transpose: l b pd --> b l pd
-        zxBCdt = rearrange(zxBCdt, "l b d -> b l d").contiguous()
-
-        # (nheads_local_tpcp)
-        A = -torch.exp(self.cp.get_A_log().float())
-
-        z, xBC, dt = torch.split(
-            zxBCdt,
-            [
-                self.cp.d_inner_local_tpcp,
-                self.cp.d_inner_local_tpcp + 2 * self.cp.ngroups_local_tpcp * self.d_state,
-                self.cp.nheads_local_tpcp,
-            ],
-            dim=-1,
-        )
-
-        # transpose: b l pd --> b pd l
-        xBC = rearrange(xBC, "b l d -> b d l").contiguous()
-
-        # Compute short convolution
-        if conv_state is not None:
-            # If we just take x[:, :, -self.d_conv :], it will error if seqlen < self.d_conv
-            # Instead F.pad will pad with zeros if seqlen < self.d_conv, and truncate otherwise.
-            conv_state.copy_(F.pad(xBC, (self.d_conv - xBC.shape[-1], 0)))  # Update state (B D W)
-
-        seqlen = xBC.size(2)
-        if causal_conv1d_fn is None:
-            xBC = self.act(self.cp.conv1d(xBC)[..., :seqlen])
-        else:
-            assert self.activation in ["silu", "swish"]
-            xBC = causal_conv1d_fn(
-                x=xBC,
-                weight=rearrange(self.cp.get_conv1d_weight(), "d 1 w -> d w"),
-                bias=self.cp.get_conv1d_bias(),
-                activation=self.activation,
-            )
-
-        # transpose b pd l --> b l pd
-        xBC = rearrange(xBC, "b d l ->  b l d").contiguous()
-
-        x, B, C = torch.split(
-            xBC,
-            [
-                self.cp.d_inner_local_tpcp,
-                self.cp.ngroups_local_tpcp * self.d_state,
-                self.cp.ngroups_local_tpcp * self.d_state,
-            ],
-            dim=-1,
-        )
-
-        # TODO Vijay: fuse most of the transposes with the GEMMS
-        x = rearrange(x, "b l (h p) -> b l h p", p=self.headdim).contiguous()
-        dt = dt.contiguous()
-        B = rearrange(B, "b l (g n) -> b l g n", n=self.d_state).contiguous()
-        C = rearrange(C, "b l (g n) -> b l g n", n=self.d_state).contiguous()
-        z = rearrange(z, "b l (h p) -> b l h p", p=self.headdim).contiguous()
-
-        # If `rmsnorm == False`, then the norm inside `mamba_chunk_scan_combined` will be used.
-        # In this case, if `cp_size > 1` then that norm could be performed on less heads than if
-        # `cp_size == 1` (groups of heads can be sharded across CP ranks), which would be
-        # mathematically incorrect, and potentially arithmetically unstable.
-        assert (
-            self.cp.cp_size == 1 or self.rmsnorm
-        ), "Context parallel not supported for use_mem_eff_path==False and rmsnorm==False"
-
-        y = mamba_chunk_scan_combined(
-            x,
-            dt,
-            A,
-            B,
-            C,
-            self.chunk_size,
-            D=(
-                rearrange(self.cp.get_D().float(), "(h p) -> h p", p=self.headdim)
-                if self.D_has_hdim
-                else self.cp.get_D()
-            ),
-            z=z if not self.rmsnorm else None,
-            dt_bias=self.cp.get_dt_bias().float(),
-            dt_softplus=True,
-            return_final_states=ssm_state is not None,
-        )
-
-        if ssm_state is not None:
-            y, last_state = y
-            ssm_state.copy_(last_state)
-
-        y = rearrange(y, "b l h p -> l b (h p)").contiguous()
-        y = self.cp.post_conv_ssm(y)
-
-        if self.rmsnorm:
-            z = rearrange(z, "b l h p -> l b (h p)").contiguous()
-            z = self.cp.post_conv_ssm(z)
-            y = self.norm(y, z)
-
-        return y
-
-    def ssm_decode(
-        self, zxBCdt: torch.Tensor, conv_state: torch.Tensor, ssm_state: torch.Tensor
-    ) -> torch.Tensor:
-        """Performs SSM computation for inference decode step."""
-
-        dtype = zxBCdt.dtype
-        assert zxBCdt.shape[0] == 1, "Only support decoding with 1 token at a time for now"
-
-        # l b d --> b d
-        zxBCdt = zxBCdt.squeeze(0)
-
-        z, xBC, dt = torch.split(
-            zxBCdt,
-            [
-                self.d_inner_local_tp,
-                self.d_inner_local_tp + 2 * self.ngroups_local_tp * self.d_state,
-                self.nheads_local_tp,
-            ],
-            dim=-1,
-        )
-
-        # Conv step
-        if causal_conv1d_update is None:
-            conv_state.copy_(torch.roll(conv_state, shifts=-1, dims=-1))  # Update state (B D W)
-            conv_state[:, :, -1] = xBC
-            xBC = torch.sum(
-                conv_state * rearrange(self.conv1d.weight, "d 1 w -> d w"), dim=-1
-            )  # (B D)
-            if self.conv1d.bias is not None:
-                xBC = xBC + self.conv1d.bias
-            xBC = self.act(xBC).to(dtype=dtype)
-        else:
-            xBC = causal_conv1d_update(
-                xBC,
-                conv_state,
-                rearrange(self.conv1d.weight, "d 1 w -> d w"),
-                self.conv1d.bias,
-                self.activation,
-            )
-
-        x, B, C = torch.split(
-            xBC,
-            [
-                self.d_inner_local_tp,
-                self.ngroups_local_tp * self.d_state,
-                self.ngroups_local_tp * self.d_state,
-            ],
-            dim=-1,
-        )
-        A = -torch.exp(self.A_log.float())
-
-        # SSM step
-        if selective_state_update is None:
-            if self.ngroups_local_tp > 1:
-                B = rearrange(B, "b (g n) -> b g n", n=self.d_state)
-                C = rearrange(C, "b (g n) -> b g n", n=self.d_state)
-                B = repeat(
-                    B, "b g n -> b (g h) n", h=self.d_inner_local_tp // self.ngroups_local_tp
-                )
-                C = repeat(
-                    C, "b g n -> b (g h) n", h=self.d_inner_local_tp // self.ngroups_local_tp
-                )
-
-                dt = repeat(dt, "b h -> b (h p)", p=self.headdim)
-                dt_bias = repeat(self.dt_bias, "h -> (h p)", p=self.headdim)
-                A = repeat(A, "h -> (h p) n", p=self.headdim, n=self.d_state)
-                D = repeat(self.D, "h -> (h p)", p=self.headdim)
-
-                dt = F.softplus(dt + dt_bias.to(dtype=dt.dtype))
-                dA = torch.exp(torch.einsum("bd,dn->bdn", dt, A))
-
-                dB_x = torch.einsum("bd,bdn,bd->bdn", dt, B, x)
-                ssm_state.copy_(
-                    ssm_state * rearrange(dA, "b (h p) n -> b h p n", p=self.headdim)
-                    + rearrange(dB_x, "b (h p) n -> b h p n", p=self.headdim)
-                )
-
-                y = torch.einsum(
-                    "bdn,bdn->bd",
-                    rearrange(ssm_state.to(dtype), "b h p n -> b (h p) n", p=self.headdim),
-                    C,
-                )
-                y = y + D.to(dtype) * x
-                if not self.rmsnorm:
-                    y = y * self.act(z)  # (B D)
-            else:
-                # Discretize A and B (b (g n))
-                dt = F.softplus(dt + self.dt_bias.to(dtype=dt.dtype))  # (batch, nheads)
-                dA = torch.exp(dt * A)
-                x = rearrange(x, "b (h p) -> b h p", p=self.headdim)
-                dBx = torch.einsum("bh,bn,bhp->bhpn", dt, B, x)
-                ssm_state.copy_(ssm_state * rearrange(dA, "b h -> b h 1 1") + dBx)
-                y = torch.einsum("bhpn,bn->bhp", ssm_state.to(dtype), C)
-                y = y + rearrange(self.D.to(dtype), "h -> h 1") * x
-                y = rearrange(y, "b h p -> b (h p)")
-                if not self.rmsnorm:
-                    y = y * self.act(z)  # (B D)
-        else:
-            A = repeat(A, "h -> h p n", p=self.headdim, n=self.d_state).to(dtype=torch.float32)
-            dt = repeat(dt, "b h -> b h p", p=self.headdim)
-            dt_bias = repeat(self.dt_bias, "h -> h p", p=self.headdim)
-            D = repeat(self.D, "h -> h p", p=self.headdim)
-            B = rearrange(B, "b (g n) -> b g n", g=self.ngroups_local_tp)
-            C = rearrange(C, "b (g n) -> b g n", g=self.ngroups_local_tp)
-            x_reshaped = rearrange(x, "b (h p) -> b h p", p=self.headdim)
-            if not self.rmsnorm:
-                z = rearrange(z, "b (h p) -> b h p", p=self.headdim)
-            y = selective_state_update(
-                ssm_state,
-                x_reshaped,
-                dt,
-                A,
-                B,
-                C,
-                D,
-                z=z if not self.rmsnorm else None,
-                dt_bias=dt_bias,
-                dt_softplus=True,
-            )
-            y = rearrange(y, "b h p -> b (h p)")
-
-        if self.rmsnorm:
-            y = self.norm(y, z)
-
-        # b (h p) -> l b (h p)
-        return y.unsqueeze(0)
-
-    def allocate_inference_cache(self, batch_size, max_seqlen, dtype=None):
-        """
-        allocate inference cache
-        """
-        device = self.out_proj.weight.device
-        conv_dtype = self.conv1d.weight.dtype if dtype is None else dtype
-        conv_state = torch.zeros(
-            batch_size, self.conv1d.weight.shape[0], self.d_conv, device=device, dtype=conv_dtype
-        )
-        ssm_dtype = self.in_proj.weight.dtype if dtype is None else dtype
-        # ssm_dtype = torch.float32
-        ssm_state = torch.zeros(
-            batch_size,
-            self.nheads_local_tp,
-            self.headdim,
-            self.d_state,
-            device=device,
-            dtype=ssm_dtype,
-        )
-        return conv_state, ssm_state
-
-    def _get_states_from_cache(self, inference_context, batch_size, *, inference_params=None):
-        """Initializes or retrieves the SSM state tensors from the cache.
-
-        At the start of any inference (at the prefill step), if there is no cache or if the
-        cached batch size has changed, then new tensors are initialized and stored in the cache.
-        Otherwise the existing tensors are retrieved from the cache and zeroed out.
-        """
-
-        inference_context = deprecate_inference_params(inference_context, inference_params)
-
-        assert inference_context is not None
-        assert self.layer_number is not None
-        if (
-            self.layer_number not in inference_context.key_value_memory_dict
-            or batch_size != self.cached_batch_size
-        ):
-            conv_state = torch.zeros(
-                batch_size,
-                self.conv1d.weight.shape[0],
-                self.d_conv,
-                device=self.conv1d.weight.device,
-                dtype=self.conv1d.weight.dtype,
-            )
-            ssm_state = torch.zeros(
-                batch_size,
-                self.nheads_local_tp,
-                self.headdim,
-                self.d_state,
-                device=self.in_proj.weight.device,
-                dtype=self.in_proj.weight.dtype,
-            )
-            inference_context.key_value_memory_dict[self.layer_number] = (conv_state, ssm_state)
-            self.cached_batch_size = batch_size
-        else:
-            conv_state, ssm_state = inference_context.key_value_memory_dict[self.layer_number]
-            # TODO: Remove reference to `inference_context.sequence_len_offset` for dynamic batching
-            if inference_context.sequence_len_offset == 0:
-                conv_state.zero_()
-                ssm_state.zero_()
-        return conv_state, ssm_state
+        return out, out_bias
 
     def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
         """Provide a sharded state dictionary for distributed checkpointing."""
