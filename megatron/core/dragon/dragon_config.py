@@ -753,6 +753,12 @@ class DragonConfig(ModelParallelConfig):
     """The number of heads used in Mamba layers. 
     If None, the number of heads will be hidden_size * expand // mamba_head_dim."""
 
+    mamba_rope_fraction: float = 0.5
+
+    mamba_mimo_dim: int = 4
+
+    mamba_mimo_proj_block_order: int = 1
+
     use_mamba_mem_eff_path: bool = True
     """If True, use the memory efficient path for Mamba layers."""
 

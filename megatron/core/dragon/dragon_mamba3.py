@@ -10,18 +10,21 @@ import math
 import warnings
 from dataclasses import dataclass, replace
 from typing import List, Optional, Tuple, Union
+from contextlib import nullcontext
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch import Tensor
 
 from megatron.core.dist_checkpointing import ShardedTensor
 from megatron.core.dist_checkpointing.mapping import ReplicaId, ShardedTensorFactory
-from megatron.core.inference.contexts import BaseInferenceContext, DynamicInferenceContext
+from megatron.core.inference.contexts import BaseInferenceContext
+from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel import get_cuda_rng_tracker
-from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.module import MegatronModule
+from megatron.core.dragon.dragon_config import DragonConfig
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.utils import (
     make_sharded_tensors_for_checkpoint,
@@ -30,22 +33,13 @@ from megatron.core.transformer.utils import (
 from megatron.core.utils import deprecate_inference_params, log_single_rank
 
 try:
-    from causal_conv1d import causal_conv1d_fn
-except ImportError:
-    causal_conv1d_fn = None
-
-try:
+    from dragon_mamba3_ops.mimo_variant.ssd_mimo import mamba_chunk_scan_discretized_fused_combined as mamba_mimo_chunk_scan_discretized_fused_combined
+    from dragon_mamba3_ops.angle_cumsum import angle_dt
+    from dragon_mamba3_ops.rotary_mamba_mimo import rotary_qk as mimo_rotary_qk
     from mamba_ssm.ops.triton.layernorm_gated import RMSNorm as RMSNormGated
-    from mamba_ssm.ops.triton.ssd_combined import (
-        mamba_chunk_scan_combined,
-        mamba_split_conv1d_scan_combined,
-    )
 
     HAVE_MAMBA_SSM = True
 except ImportError:
-    from unittest.mock import MagicMock
-
-    RMSNormGated = MagicMock()
     HAVE_MAMBA_SSM = False
 
 try:
@@ -57,7 +51,6 @@ except ImportError:
 
 
 logger = logging.getLogger(__name__)
-
 
 class ExtendedRMSNorm(RMSNormGated):
     """
@@ -71,74 +64,23 @@ class ExtendedRMSNorm(RMSNormGated):
             state_dict, prefix, {"weight": 0}, sharded_offsets
         )
 
-
 @dataclass
-class MambaMixerSubmodules:
+class Mamba3Submodules:
     """
     Contains the module specs for the input and output linear layers.
     """
 
     in_proj: Union[ModuleSpec, type] = None
-    out_proj: Union[ModuleSpec, type] = None
+    b_norm: Union[ModuleSpec, type] = None
+    c_norm: Union[ModuleSpec, type] = None
+    rope_proj: Union[ModuleSpec, type] = None
 
-
-class MambaMixer(MegatronModule):
-    """
-    Args:
-        config: The config of the model.
-        submodules: Contains the module specs for the input and output linear layers.
-        d_model: The hidden size of the model.
-        d_state: The state size of the SSM.
-        d_conv: The number of channels in the causal convolution.
-        conv_init: The initialization range for the causal convolution weights.
-        expand: The expansion factor for the SSM.
-        headdim: The hidden size of each attention head.
-        ngroups: The number of attention heads.
-        A_init_range: The initialization range for the attention weights.
-        D_has_hdim: Whether the D parameter has the same number of dimensions as the hidden
-            state.
-        rmsnorm: Whether to use root mean square normalization.
-        norm_before_gate: Whether to apply normalization before the gating mechanism.
-        dt_min: The minimum value of the dt parameter.
-        dt_max: The maximum value of the dt parameter.
-        dt_init: The initialization value of the dt parameter.
-        dt_scale: The scaling factor for the dt parameter.
-        dt_init_floor: The minimum value of the dt parameter after initialization.
-        bias: Whether to use bias in the linear layers.
-        conv_bias: Whether to use bias in the causal convolution.
-        chunk_size: The chunk size for the fused kernel.
-        use_mem_eff_path: Whether to use the memory-efficient path for the Mamba model.
-        layer_number: The layer number of this Mamba layer.
-        pg_collection: The required process groups to use for tensor model parallel and context
-            parallel.
-    """
-
+class Mamba3(MegatronModule):
     def __init__(
         self,
-        config: TransformerConfig,
-        submodules: MambaMixerSubmodules,
-        d_model,
-        d_conv=4,
-        conv_init=None,
-        expand=2,
-        A_init_range=(1, 16),
-        D_has_hdim=False,
-        rmsnorm=True,
-        norm_before_gate=False,
-        dt_min=0.001,
-        dt_max=0.1,
-        dt_init="random",
-        dt_scale=1.0,
-        dt_init_floor=1e-4,
-        bias=False,
-        conv_bias=True,
-        # Fused kernel and sharding options
-        chunk_size=128,
-        layer_number=None,
-        use_mem_eff_path=None,
-        d_state=None,
-        headdim=None,
-        ngroups=None,
+        config: DragonConfig,
+        submodules: Mamba3Submodules,
+        layer_number: int,
         pg_collection: ProcessGroupCollection = None,
     ):
         if not HAVE_MAMBA_SSM:
@@ -151,47 +93,29 @@ class MambaMixer(MegatronModule):
 
         super().__init__(config)
         self.config = config
-        self.d_model = d_model
-        self.d_conv = d_conv
-        self.conv_init = conv_init
-        self.expand = expand
-        self.d_inner = int(self.expand * self.d_model)
-        self.D_has_hdim = D_has_hdim
-        self.rmsnorm = rmsnorm
-        self.norm_before_gate = norm_before_gate
-        self.chunk_size = chunk_size
         self.layer_number = layer_number
-        self.cached_batch_size = None
-        assert pg_collection is not None, "pg_collection must be provided for MambaMixer"
+
+        self.d_model = config.hidden_size
+        self.d_inner = int(2 * self.d_model)
+        self.rope_fraction = self.config.mamba_rope_fraction
+        self.mimo_dim = self.config.mamba_mimo_dim
+        self.mimo_proj_block_order = self.config.mamba_mimo_proj_block_order
+        self.A_floor = 1e-4
+        self.chunk_size = 128
+        assert pg_collection is not None, "pg_collection must be provided for Mamba3"
         self.pg_collection = pg_collection
 
-        # Check for deprecated arguments and raise warnings
-        if use_mem_eff_path is not None:
-            warnings.warn(
-                "The 'use_mem_eff_path' argument is deprecated and will be removed in the future. "
-                "Please use the value from the TransformerConfig object instead.",
-                DeprecationWarning,
-            )
-        if d_state is not None:
-            warnings.warn(
-                "The 'd_state' argument is deprecated and will be removed in the future. "
-                "Please use the value from the TransformerConfig object instead.",
-                DeprecationWarning,
-            )
-        if headdim is not None:
-            warnings.warn(
-                "The 'headdim' argument is deprecated and will be removed in the future. "
-                "Please use the value from the TransformerConfig object instead.",
-                DeprecationWarning,
-            )
-        if ngroups is not None:
-            warnings.warn(
-                "The 'ngroups' argument is deprecated and will be removed in the future. "
-                "Please use the value from the TransformerConfig object instead.",
-                DeprecationWarning,
+        self.use_mem_eff_path = self.config.use_mamba_mem_eff_path
+        if not self.use_mem_eff_path:
+            log_single_rank(
+                logger,
+                logging.WARNING,
+                (
+                    "We are not currently using or functionally testing use_mem_eff_path==False "
+                    "for training. It may not work as expected."
+                ),
             )
 
-        self.use_mem_eff_path = self.config.use_mamba_mem_eff_path
         self.d_state = self.config.mamba_state_dim
         self.headdim = self.config.mamba_head_dim
         self.ngroups = self.config.mamba_num_groups
@@ -207,6 +131,12 @@ class MambaMixer(MegatronModule):
         else:
             assert self.d_inner % self.headdim == 0, "d_inner must be evenly divisible by headdim"
             self.nheads = self.d_inner // self.headdim
+        self.dr_out_dim = self.d_inner // self.mimo_proj_block_order
+
+        self.split_tensor_size = int(self.d_state * self.rope_fraction)
+        if self.split_tensor_size % 2 != 0:
+            self.split_tensor_size -= 1
+        self.num_rope_angles = self.split_tensor_size // 2
 
         if self.config.fp8:
             assert (2 * self.d_inner + 2 * self.ngroups * self.d_state + self.nheads) % 16 == 0, (
@@ -218,11 +148,14 @@ class MambaMixer(MegatronModule):
 
         # Ensure that each TP rank gets at least one head:
         assert self.nheads % tp_size == 0, "nheads must be evenly divisble by tp_size"
+        self.nheads_per_group = self.nheads // self.ngroups
         self.nheads_local_tp = self.nheads // tp_size
 
         # Note that we do not need to confirm that `d_inner % tp_size == 0` because
         # `d_inner % headdim == 0`, `nheads = d_inner // headdim`, and `nheads % tp_size == 0`
+        self.d_inner_per_group = self.d_inner // self.ngroups
         self.d_inner_local_tp = self.d_inner // tp_size
+        self.dr_out_dim_local_tp = self.dr_out_dim // tp_size
 
         # Ensure that each TP rank gets at least one group:
         assert self.ngroups % tp_size == 0, "ngroups must be evenly divisible by tp_size"
@@ -231,57 +164,69 @@ class MambaMixer(MegatronModule):
         # Ensure that each group has a positive integer number of heads:
         assert self.nheads % self.ngroups == 0, "nheads must be evenly divisible by ngroups"
 
-        assert not bias
-        assert not self.norm_before_gate
-
         # Assume sequence parallelism: input is already partitioned along the sequence dimension
         self.in_proj = build_module(
             submodules.in_proj,
             self.d_model,
-            self.d_inner * 2 + 2 * self.ngroups * self.d_state + self.nheads,  # z x B C dt
+            self.d_inner * 2 + 2 * self.ngroups * self.d_state * self.mimo_dim + 3 * self.nheads,  # z x B C dt A trap
             config=self.config,
             init_method=self.config.init_method,
             gather_output=False,
-            bias=bias,
+            bias=False,
             skip_bias_add=False,
             is_expert=False,
-            tp_comm_buffer_name="fc1",
+            tp_comm_buffer_name="in_proj",
             tp_group=self.pg_collection.tp,
         )
+        # WARNING: A_proj was specified as "float32". here, we merge it with in_proj so it's no longer float32.
 
-        if not self.use_mem_eff_path:
-            log_single_rank(
-                logger,
-                logging.WARNING,
-                (
-                    "We are not currently using or functionally testing use_mem_eff_path==False "
-                    "for training. It may not work as expected."
-                ),
-            )
+        self.rope_proj = build_module(
+            submodules.rope_proj,
+            self.config.hidden_size,
+            self.num_rope_angles,
+            config=self.config,
+            init_method=self.config.init_method,
+            bias=False,
+            skip_bias_add=False,
+            skip_weight_param_allocation=False,
+            parallel_mode='duplicated', # duplicated across ranks. TODO: train and check that they are indeed synced across ranks.
+            is_expert=False,
+            tp_comm_buffer_name='rope_proj',
+        )
 
-        conv_dim = self.d_inner_local_tp + 2 * self.ngroups_local_tp * self.d_state  # x B C
-        with get_cuda_rng_tracker().fork():
-            # weight shape: [conv_dim, 1, d_conv]
-            # bias shape: [conv_dim]
-            self.conv1d = nn.Conv1d(
-                in_channels=conv_dim,
-                out_channels=conv_dim,
-                bias=conv_bias,
-                kernel_size=d_conv,
-                groups=conv_dim,
-                padding=d_conv - 1,
-                device=torch.cuda.current_device(),
-                dtype=config.params_dtype,
-            )
-            setattr(self.conv1d.weight, "tensor_model_parallel", True)
-            setattr(self.conv1d.bias, "tensor_model_parallel", True)
+        self.B_bias = nn.Parameter(torch.ones((self.mimo_dim, self.nheads_local_tp, self.d_state)), requires_grad=True)
+        self.C_bias = nn.Parameter(torch.ones((self.mimo_dim, self.nheads_local_tp, self.d_state)), requires_grad=True)
+        setattr(self.B_bias, "tensor_model_parallel", True)
+        setattr(self.C_bias, "tensor_model_parallel", True)
+        self.B_norm = build_module(
+            submodules.b_norm,
+            hidden_size=self.d_state,
+            config=self.config,
+             eps=self.config.layernorm_epsilon,
+        )
+        self.C_norm = build_module(
+            submodules.c_norm,
+            hidden_size=self.d_state,
+            config=self.config,
+            eps=self.config.layernorm_epsilon,
+        )
 
-            if self.conv_init is not None:
-                nn.init.uniform_(self.conv1d.weight, -self.conv_init, self.conv_init)
+        # Initialize up/down MIMO projection (for x and z)
+        in_proj_mimo_x_init_weights = torch.ones(self.dr_out_dim_local_tp, self.mimo_dim*self.mimo_proj_block_order, self.mimo_proj_block_order)
+        in_proj_mimo_z_init_weights = torch.ones(self.dr_out_dim_local_tp, self.mimo_dim*self.mimo_proj_block_order, self.mimo_proj_block_order)
+        out_proj_mimo_init_weights = torch.ones(self.dr_out_dim_local_tp, self.mimo_proj_block_order, self.mimo_dim*self.mimo_proj_block_order)
+        self.in_proj_mimo_x = nn.Parameter(in_proj_mimo_x_init_weights, requires_grad=True)
+        self.in_proj_mimo_z = nn.Parameter(in_proj_mimo_z_init_weights, requires_grad=True)
+        self.out_proj_mimo = nn.Parameter(out_proj_mimo_init_weights, requires_grad=True)
+        setattr(self.in_proj_mimo_x, "tensor_model_parallel", True)
+        setattr(self.in_proj_mimo_z, "tensor_model_parallel", True)
+        setattr(self.out_proj_mimo, "tensor_model_parallel", True)
 
-        self.activation = "silu"
-
-        with get_cuda_rng_tracker().fork():
+        #with get_cuda_rng_tracker().fork(): # TODO TEMP
+        with nullcontext():
+            dt_min = 0.001
+            dt_max = 0.1
+            dt_init_floor = 1e-4
             # Initialize dt bias so that F.softplus(dt_bias) is between dt_min and dt_max
             dt = torch.exp(
                 torch.rand(
@@ -304,43 +249,34 @@ class MambaMixer(MegatronModule):
             self.dt_bias._no_weight_decay = True
             setattr(self.dt_bias, "tensor_model_parallel", True)
 
-            # A parameter
-            assert A_init_range[0] > 0 and A_init_range[1] >= A_init_range[0]
-            A = torch.empty(
-                self.nheads_local_tp, dtype=torch.float32, device=torch.cuda.current_device()
-            ).uniform_(*A_init_range)
-            A_log = torch.log(A)  # Keep A_log in fp32
-            self.A_log = nn.Parameter(A_log)
-            self.A_log._no_weight_decay = True
-            setattr(self.A_log, "tensor_model_parallel", True)
-
         # D "skip" parameter
-        self.D = nn.Parameter(
-            torch.ones(
-                self.d_inner_local_tp if self.D_has_hdim else self.nheads_local_tp,
-                device=torch.cuda.current_device(),
-            )
-        )  # Keep in fp32
-        self.D._no_weight_decay = True
+        self.D = nn.Parameter(torch.ones(self.nheads_local_tp, device=torch.cuda.current_device())) # Keep in fp32
+        self.D._no_weight_decay = True # useless flag
         setattr(self.D, "tensor_model_parallel", True)
 
-        if self.rmsnorm:
-            assert RMSNormGated is not None
-            self.norm = ExtendedRMSNorm(
-                self.d_inner_local_tp,
-                eps=1e-5,
-                group_size=self.d_inner_local_tp // self.ngroups_local_tp,
-                norm_before_gate=self.norm_before_gate,
-                device=torch.cuda.current_device(),
-                dtype=config.params_dtype,
-            )
-
-        # todo: out_proj: self.d_inner -> self.d_model
+        self.output_norm = ExtendedRMSNorm(
+            self.d_inner_local_tp,
+            eps=config.layernorm_epsilon,
+            group_size=self.d_inner_local_tp // self.ngroups_local_tp,
+            norm_before_gate=False,
+            device=torch.cuda.current_device(),
+            dtype=config.params_dtype,
+        )
 
     def forward(
         self,
-        hidden_states,
-        inference_context=None,
+        hidden_states: Tensor,
+        attention_mask: Tensor,
+        key_value_states: Optional[Tensor] = None,
+        inference_context: Optional[BaseInferenceContext] = None,
+        rotary_pos_emb: Optional[Union[Tensor, Tuple[Tensor, Tensor]]] = None,
+        rotary_pos_cos: Optional[Tensor] = None,
+        rotary_pos_sin: Optional[Tensor] = None,
+        rotary_pos_cos_sin: Optional[Tensor] = None,
+        attention_bias: Optional[Tensor] = None,
+        window_size: Optional[Tuple[int, int]] = None, # not used, for compatibility
+        packed_seq_params: Optional[PackedSeqParams] = None,
+        sequence_len_offset: Optional[int] = None,
         *,
         inference_params: Optional[BaseInferenceContext] = None,
     ):
@@ -353,42 +289,109 @@ class MambaMixer(MegatronModule):
         in_inference_mode = inference_context is not None and not self.training
         assert not in_inference_mode
 
-        zxBCdt, _ = self.in_proj(hidden_states)
+        # Input projection
+        zxBCdtAtrap, _ = self.in_proj(hidden_states)
+        zxBCdtAtrap = zxBCdtAtrap.transpose(0, 1) # s b x --> b s x
+        zxBCdtAtrap = rearrange(zxBCdtAtrap, "b l (G D) -> b l G D", G=self.ngroups_local_tp)#.contiguous()
+        # split per group: [B, L, G_local, D_group]
+        z = zxBCdtAtrap[..., 0:self.d_inner_per_group]; accum = self.d_inner_per_group
+        x = zxBCdtAtrap[..., accum:accum+self.d_inner_per_group]; accum += self.d_inner_per_group
+        B = zxBCdtAtrap[..., accum:accum+self.d_state*self.mimo_dim]; accum += self.d_state*self.mimo_dim
+        C = zxBCdtAtrap[..., accum:accum+self.d_state*self.mimo_dim]; accum += self.d_state*self.mimo_dim
+        dt = zxBCdtAtrap[..., accum:accum+self.nheads_per_group]; accum += self.nheads_per_group
+        A = zxBCdtAtrap[..., accum:accum+self.nheads_per_group]; accum += self.nheads_per_group
+        trap = zxBCdtAtrap[..., accum:accum+2*self.nheads_per_group]
 
-        # transpose: l b pd --> b l pd
-        zxBCdt = rearrange(zxBCdt, "l b d -> b l d").contiguous()
-        A = -torch.exp(self.A_log.float())
+        z = rearrange(z, "b l G d -> b l (G d)")
+        x = rearrange(x, "b l G d -> b l (G d)")
+        B = rearrange(B, "b l G d -> b l (G d)")
+        C = rearrange(C, "b l G d -> b l (G d)")
+        dt = rearrange(dt, "b l G n -> b l (G n)")
+        A = rearrange(A, "b l G n -> b l (G n)")
+        trap = rearrange(trap, "b l G n -> b l (G n)")
 
-        # TODO(duncan): Can this code be removed?
-        if self.conv1d.bias is not None:
-            self.conv1d.bias.data_ptr()
+        _A = -F.softplus(A.to(torch.float32)) # (B, L, N)
+        _A = torch.clamp(_A, max=-self.A_floor)
+        dt = F.softplus(dt + self.dt_bias) # (B, L, N)
 
-        y = mamba_split_conv1d_scan_combined(
-            zxBCdt,
-            rearrange(self.conv1d.weight, "d 1 w -> d w"),
-            self.conv1d.bias,
-            self.dt_bias.float(),
-            A,
-            D=(
-                rearrange(self.D.float(), "(h p) -> h p", p=self.headdim)
-                if self.D_has_hdim
-                else self.D
-            ),
+        # Perform MIMO x and z up projection (d_inner -> mimo_rank*d_inner)
+        x = rearrange(x, "b l (d g) -> b l d g", g=self.mimo_proj_block_order)
+        x = torch.einsum("bldg,drg->blrd", x, self.in_proj_mimo_x)
+
+        z = rearrange(z, "b l (d g) -> b l d g", g=self.mimo_proj_block_order)
+        z = torch.einsum("bldg,drg->blrd", z, self.in_proj_mimo_z)
+
+        if self.mimo_proj_block_order > 1:
+            x = rearrange(x, "b l g d -> b l (g d)")
+            x = rearrange(x, "b l (r d) -> b l r d", r=self.mimo_dim)
+            z = rearrange(z, "b l g d -> b l (g d)")
+            z = rearrange(z, "b l (r d) -> b l r d", r=self.mimo_dim)
+
+        B = rearrange(B, "b l (g r n) -> b l r g n", g=self.ngroups_local_tp, r=self.mimo_dim)
+        C = rearrange(C, "b l (g r n) -> b l r g n", g=self.ngroups_local_tp, r=self.mimo_dim)    
+
+        B = self.B_norm(B)
+        C = self.C_norm(C)
+
+        if self.ngroups != self.nheads:
+            n_repeat = self.nheads_local_tp // self.ngroups_local_tp
+            assert self.nheads_local_tp % self.ngroups_local_tp == 0
+            B = B.repeat(1, 1, 1, n_repeat, 1) # (B, L, R, N, S)
+            C = C.repeat(1, 1, 1, n_repeat, 1) # (B, L, R, N, S)
+
+        angle, _ = self.rope_proj(hidden_states.transpose(0, 1)) # (B, L, S)
+        angle = angle.unsqueeze(-2).expand(-1, -1, self.nheads_local_tp, -1) # (B, L, G, S)
+        angle = angle_dt(angle, dt)
+
+        C, B, CB_sum = mimo_rotary_qk(q=C, k=B, angle=angle, bias_q=self.C_bias, bias_k=self.B_bias, conjugate=False, inplace=False)
+
+        x = rearrange(x, "b l r (h p) -> b l r h p", p=self.headdim)
+
+        A = _A * dt
+        gating_factor = dt # B, L, N
+
+        trap = F.sigmoid(trap) # (B, L, N)
+
+        alpha_arr = torch.exp(A)
+        beta_arr = (1-trap)*gating_factor*alpha_arr
+        gamma_arr = trap*gating_factor
+
+        # roll alpha and beta to the left by 1
+        _alpha_arr = torch.roll(alpha_arr, shifts=-1, dims=1)
+        _beta_arr = torch.roll(beta_arr, shifts=-1, dims=1)
+
+        x_scalar = (gamma_arr*_alpha_arr + _beta_arr).to(torch.bfloat16)
+
+        z = rearrange(z, "b l r (h p) -> b l r h p", p=self.headdim)
+
+        y = mamba_mimo_chunk_scan_discretized_fused_combined(
+            x=x.bfloat16(),
+            A=A.bfloat16(),
+            B=B.bfloat16(),
+            C=C.bfloat16(),
             chunk_size=self.chunk_size,
-            activation=self.activation,
-            headdim=None if self.D_has_hdim else self.headdim,
-            ngroups=self.ngroups_local_tp,
-            norm_before_gate=self.norm_before_gate,
+            x_scalar=x_scalar,
+            gamma=gamma_arr,
+            CB_sum=CB_sum,
+            D=self.D,
+            z=None,
         )
 
-        y = rearrange(y, "b l d -> l b d").contiguous()
+        y = rearrange(y, "b l r h p -> b l r (h p)")
 
-        if self.rmsnorm:
-            y = self.norm(y)
+        z = rearrange(z, "b l r h p -> b l r (h p)")
+        y = self.output_norm(y, z)
 
-        out, out_bias = self.out_proj(y)
+        # Perform MIMO down projection (mimo_rank*d_inner -> d_inner)
+        y = rearrange(y, "b l r d -> b l (r d)")
+        y = rearrange(y, "b l (g d) -> b l g d", g=self.mimo_dim*self.mimo_proj_block_order)
+        y = torch.einsum("blgd,drg->bldr", y.float(), self.out_proj_mimo) # TODO TEMP
+        y = rearrange(y, "b l d r -> b l (d r)")
+        y = rearrange(y, "b l (h d) -> b l h d", d=self.headdim)
 
-        return out, out_bias
+        y = y.transpose(0, 1).contiguous() # b s h d -> s b h d
+
+        return y
 
     def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
         """Provide a sharded state dictionary for distributed checkpointing."""
@@ -407,17 +410,9 @@ class MambaMixer(MegatronModule):
         )
         # Submodules
         for name, module in self.named_children():
-            if name == "conv1d":
-                # Add TP sharding for Conv1d
-                module_sd = module.state_dict(prefix="", keep_vars=True)
-                module_sharded_sd = make_sharded_tensors_for_checkpoint(
-                    module_sd, f"{prefix}{name}.", {f"weight": 0, f"bias": 0}, sharded_offsets
-                )
-
-            else:
-                module_sharded_sd = sharded_state_dict_default(
-                    module, f"{prefix}{name}.", sharded_offsets, metadata
-                )
+            module_sharded_sd = sharded_state_dict_default(
+                module, f"{prefix}{name}.", sharded_offsets, metadata
+            )
 
             sharded_state_dict.update(module_sharded_sd)
 
@@ -445,28 +440,6 @@ class MambaMixer(MegatronModule):
             ["z", "x", "B", "C", "dt"],
             0,
         )
-
-        conv_dim = self.d_inner_local_tp + 2 * self.ngroups_local_tp * self.d_state
-        assert sharded_state_dict[f"{prefix}conv1d.weight"].data.size(0) == conv_dim, (
-            conv_dim,
-            sharded_state_dict[f"{prefix}conv1d.weight"],
-        )
-        assert sharded_state_dict[f"{prefix}conv1d.bias"].data.size(0) == conv_dim, (
-            conv_dim,
-            sharded_state_dict[f"{prefix}conv1d.bias"],
-        )
-
-        for conv_layer_name in ["conv1d.weight", "conv1d.bias"]:
-            sharded_state_dict[f"{prefix}{conv_layer_name}"] = _split_tensor_factory(
-                sharded_state_dict[f"{prefix}{conv_layer_name}"],
-                [
-                    self.d_inner_local_tp,
-                    self.ngroups_local_tp * self.d_state,
-                    self.ngroups_local_tp * self.d_state,
-                ],
-                ["x", "B", "C"],
-                0,
-            )
 
         return sharded_state_dict
 

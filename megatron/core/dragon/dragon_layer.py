@@ -286,7 +286,6 @@ class DragonLayer(GraphableMegatronModule, BaseDragonLayer):
             num_mixer_heads = self.mixer.num_signal_heads
             num_mixer_heads_local = self.mixer.num_signal_heads_per_partition
             head_dim = self.mixer.val_hidden_size
-            out_dim = num_mixer_heads * head_dim
         elif layer_type == 'g':
             self.mixer = build_module(
                 submodules.gdn,
@@ -297,7 +296,16 @@ class DragonLayer(GraphableMegatronModule, BaseDragonLayer):
             num_mixer_heads = self.mixer.num_heads
             num_mixer_heads_local = self.mixer.num_heads_local
             head_dim = self.mixer.value_head_dim
-            out_dim = num_mixer_heads * head_dim
+        elif layer_type == '3':
+            self.mixer = build_module(
+                submodules.mamba3,
+                config=self.config,
+                layer_number=self.layer_number,
+                pg_collection=pg_collection,
+            )
+            num_mixer_heads = self.mixer.nheads
+            head_dim = self.mixer.head_dim
+            
         else:
             raise ValueError(f"Unsupported layer type: {layer_type}")
 
@@ -317,7 +325,7 @@ class DragonLayer(GraphableMegatronModule, BaseDragonLayer):
         # [Module 4: Mixer projection]
         self.mixer_proj = build_module(
             submodules.mixer_proj,
-            out_dim,
+            num_mixer_heads*head_dim,
             self.config.hidden_size,
             config=self.config,
             init_method=self.config.init_method,

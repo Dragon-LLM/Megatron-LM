@@ -30,6 +30,7 @@ from megatron.core.dragon.dragon_block import (
 )
 from megatron.core.dragon.dragon_attention import SelfDiffAttention, SelfDiffAttentionSubmodules
 from megatron.core.dragon.dragon_gated_delta_net import GatedDeltaNet, GatedDeltaNetSubmodules
+from megatron.core.dragon.dragon_mamba3 import Mamba3, Mamba3Submodules
 from megatron.core.transformer.mlp import MLP, MLPSubmodules
 from megatron.core.transformer.moe.moe_layer import MoELayer, MoESubmodules
 from megatron.core.transformer.moe.experts import TEGroupedMLP
@@ -99,6 +100,15 @@ def get_dragon_block_spec(
             in_proj=TELayerNormColumnParallelLinear,
         )
     )
+    mamba3 = ModuleSpec(
+        module=Mamba3,
+        submodules=Mamba3Submodules(
+            in_proj=TELayerNormColumnParallelLinear,
+            b_norm=TENorm,
+            c_norm=TENorm,
+            rope_proj=TELinear,
+        ),
+    )
     if config.num_moe_experts is None or config.num_moe_experts == 0:
         mlp = ModuleSpec(
             module=MLP,
@@ -138,6 +148,7 @@ def get_dragon_block_spec(
         submodules=DragonLayerSubmodules(
             attention=attention,
             gdn=gdn,
+            mamba3=mamba3,
             mixer_norm=TENorm,
             mixer_proj=TERowParallelLinear,
             pre_mlp_norm=TENorm,

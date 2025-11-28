@@ -79,12 +79,14 @@ def _get_param_groups_uscaling(
                     size_mult = parallel_state.get_tensor_model_parallel_world_size()     
 
                 if isinstance(mod, te.pytorch.GroupedLinear):
+                    is_grouped = True
                     num_weights = mod.num_gemms
                 else:
+                    is_grouped = False
                     num_weights = 1
 
                 for w_idx in range(num_weights if num_weights > 0 else 1):
-                    weight_attr = "weight" if num_weights == 1 else f"weight{w_idx}"
+                    weight_attr = "weight" if not is_grouped else f"weight{w_idx}"
                     weight = getattr(mod, weight_attr)
 
                     if not weight.requires_grad:
