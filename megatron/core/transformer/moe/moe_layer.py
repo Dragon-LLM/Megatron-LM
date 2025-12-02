@@ -178,14 +178,14 @@ class MoELayer(BaseMoELayer):
         self.cudagraph_tensor_store = MoECudaGraphTensorStore()
 
     @maybe_skip_or_early_return_by_cudagraph("route")
-    def route(self, hidden_states: torch.Tensor):
+    def route(self, hidden_states: torch.Tensor, stashed_hs=None):
         """Compute token routing for preprocessing.
 
         This method uses the router to determine which experts to send each token to,
         producing routing probabilities and a mapping.
         """
-        probs, routing_map = self.router(hidden_states)
-        return probs, routing_map
+        probs, routing_map, stashed_hs = self.router(hidden_states, stashed_hs)
+        return probs, routing_map, stashed_hs
 
     @maybe_skip_or_early_return_by_cudagraph("preprocess")
     def preprocess(
@@ -270,7 +270,7 @@ class MoELayer(BaseMoELayer):
             output = output + shared_expert_output
         return output
 
-    def forward(self, hidden_states: torch.Tensor):
+    def forward(self, hidden_states: torch.Tensor, stashed_hs=None):
         """Forward pass for the MoE layer.
 
         The forward pass comprises four main steps:
@@ -292,10 +292,10 @@ class MoELayer(BaseMoELayer):
             )
 
         # MoE forward: route -> dispatch -> compute -> combine
-        def custom_forward(hidden_states):
+        def custom_forward(hidden_states, stashed_hs):
             try:
                 shared_expert_output = self.shared_experts_compute(hidden_states)
-                probs, routing_map = self.route(hidden_states)
+                probs, routing_map, stashed_hs = self.route(hidden_states, stashed_hs)
                 hidden_states, probs, residual = self.preprocess(hidden_states, probs, routing_map)
             except MoECudaGraphPartialCaptureSignal as e:
                 # This signal is raised from the maybe_skip_or_early_return_by_cudagraph decorator.
@@ -308,7 +308,7 @@ class MoELayer(BaseMoELayer):
             dispatched_input, probs = self.dispatch(hidden_states, probs)
             output, mlp_bias = self.routed_experts_compute(dispatched_input, probs, residual)
             output = self.combine(output, shared_expert_output)
-            return output, mlp_bias, routing_map
+            return output, mlp_bias, routing_map, stashed_hs
 
         if self.moe_layer_recompute:
             if self.config.fp8:
@@ -318,11 +318,12 @@ class MoELayer(BaseMoELayer):
                     tensor_parallel.random.get_cuda_rng_tracker,
                     parallel_state.get_tensor_model_parallel_group(),
                     hidden_states,
+                    stashed_hs,
                 )
             else:
-                outputs = tensor_parallel.checkpoint(custom_forward, False, hidden_states)
+                outputs = tensor_parallel.checkpoint(custom_forward, False, hidden_states, stashed_hs)
         else:
-            outputs = custom_forward(hidden_states)
+            outputs = custom_forward(hidden_states, stashed_hs)
 
         return outputs
 

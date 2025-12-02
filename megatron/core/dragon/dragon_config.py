@@ -109,6 +109,8 @@ class DragonConfig(ModelParallelConfig):
     num_attention_heads: int = 0
     """Number of Dragon attention heads."""
 
+    mixer_gn: bool = True
+
     num_signal_heads: int = 0
 
     tpa_rank: int = 4
@@ -457,6 +459,8 @@ class DragonConfig(ModelParallelConfig):
     ####################
     # MoE related
     ####################
+    moe_router_type: str = "classic" # "classic", "dragon"
+
     moe_shared_expert_intermediate_size: Optional[int] = None
     """Shared expert total ffn hidden size.
     It should be equal to 'num_shared_experts * ffn_size_of_each_shared_expert' if
@@ -1443,10 +1447,11 @@ class DragonConfig(ModelParallelConfig):
             ), "Bias in Moe is only supported when ETP==1"
 
         if self.moe_router_enable_expert_bias and self.moe_router_score_function != "sigmoid":
-            raise ValueError(
+            assert not self.moe_router_fusion, "uh oh"
+            """raise ValueError(
                 "Expert bias for aux-loss-free routing only supports sigmoid score function."
                 "Please set --moe-router-score-function sigmoid for sigmoid score function."
-            )
+            )"""
 
         if self.num_moe_experts and self.fp8:
             # TE version below 1.7.0 will raise Error when handle zeros tokens for expert

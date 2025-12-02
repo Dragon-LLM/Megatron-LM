@@ -244,6 +244,16 @@ def forward_step(data_iterator, model: DragonModel, return_schedule_plan: bool =
 
     #debug_batch(tokens, position_ids, cu_seqlens, max_seqlen)
 
+    # check init mean & std
+    """with torch.no_grad():
+        for name, p in model.named_parameters():
+            if p is None or p.numel() == 0:
+                continue
+            t = p.detach().float()
+            mean = t.mean().item()
+            std  = t.std(unbiased=False).item()
+            print_rank_0(f"{name:60s} shape={tuple(p.shape)} mean={mean:+.4e} std={std:.4e}")"""
+
     packed_seq_params = None
     if cu_seqlens is not None:
         assert model.config.intra_doc_masking

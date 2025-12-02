@@ -215,6 +215,7 @@ class DragonLayerSubmodules:
 
     attention: Union[ModuleSpec, type] = IdentityOp
     gdn: Union[ModuleSpec, type] = IdentityOp
+    mamba3: Union[ModuleSpec, type] = IdentityOp
     mixer_norm: Union[ModuleSpec, type] = IdentityFuncOp
     mixer_proj: Union[ModuleSpec, type] = IdentityOp
     pre_mlp_norm: Union[ModuleSpec, type] = IdentityFuncOp
@@ -305,7 +306,6 @@ class DragonLayer(GraphableMegatronModule, BaseDragonLayer):
             )
             num_mixer_heads = self.mixer.nheads
             head_dim = self.mixer.head_dim
-            
         else:
             raise ValueError(f"Unsupported layer type: {layer_type}")
 
@@ -317,10 +317,11 @@ class DragonLayer(GraphableMegatronModule, BaseDragonLayer):
             eps=self.config.layernorm_epsilon,
             use_weights=False, # manual scalers
         )
-        if not config.layernorm_zero_centered_gamma:
-            self.mixer_norm_scalers = torch.nn.Parameter(torch.ones(1, 1, num_mixer_heads_local, head_dim)) # todo: save dict!!
-        else:
-            self.mixer_norm_scalers = torch.nn.Parameter(torch.zeros(1, 1, num_mixer_heads_local, head_dim)) # todo: save dict!!
+        if config.mixer_gn:
+            if not config.layernorm_zero_centered_gamma:
+                self.mixer_norm_scalers = torch.nn.Parameter(torch.ones(1, 1, num_mixer_heads_local, head_dim)) # todo: save dict!!
+            else:
+                self.mixer_norm_scalers = torch.nn.Parameter(torch.zeros(1, 1, num_mixer_heads_local, head_dim)) # todo: save dict!!
 
         # [Module 4: Mixer projection]
         self.mixer_proj = build_module(
@@ -427,8 +428,9 @@ class DragonLayer(GraphableMegatronModule, BaseDragonLayer):
         # this is only used to uniquely identify decode and non-decode cuda graph
         # runners in the cuda graph manager
         kwargs.pop("dynamic_inference_decode_only", None)
-        residual, y_mixer = self._forward_mixer(*args, **kwargs) # (L, B, H, D)
-        y_mixer = self._torch_compiled_headwise_norm(y_mixer)
+        residual, y_mixer, stashed_hs = self._forward_mixer(*args, **kwargs) # (L, B, H, D)
+        if self.config.mixer_gn:
+            y_mixer = self._torch_compiled_headwise_norm(y_mixer)
         y_mixer = y_mixer.view(y_mixer.size(0), y_mixer.size(1), -1) # (L, B, H*D)
         nvtx_range_push(suffix="mixer_proj")
         if self.offload_mixer_proj:
@@ -447,9 +449,15 @@ class DragonLayer(GraphableMegatronModule, BaseDragonLayer):
         residual = self._torch_compiled_residual_write(residual, y_mixer, self.sqrt_one_minus_tau, self.sqrt_tau)
 
         hidden_states = self.pre_mlp_norm(residual)
-        y_mlp = self._forward_mlp(hidden_states, kwargs.get("inference_context", None))
+        out = self._forward_mlp(hidden_states, stashed_hs, kwargs.get("inference_context", None))
+        stashed_hs = None
+        if self.config.num_moe_experts is not None and self.config.num_moe_experts > 0:
+            y_mlp = out[0]
+            stashed_hs = out[3]
+        else:
+            y_mlp = out[0]
         residual = self._torch_compiled_residual_write(residual, y_mlp, self.sqrt_one_minus_tau, self.sqrt_tau)
-        return residual
+        return residual, stashed_hs
 
     def _forward_mixer(
         self,
@@ -464,6 +472,7 @@ class DragonLayer(GraphableMegatronModule, BaseDragonLayer):
         inference_context: Optional[Any] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
         sequence_len_offset: Optional[Tensor] = None,
+        stashed_hs: Optional[Tensor] = None,
         *,
         inference_params: Optional[Any] = None,
     ):
@@ -519,9 +528,9 @@ class DragonLayer(GraphableMegatronModule, BaseDragonLayer):
         )
         nvtx_range_pop(suffix="mixer")
 
-        return residual, hidden_states
+        return residual, hidden_states, stashed_hs
 
-    def _forward_mlp(self, hidden_states, inference_context=None):
+    def _forward_mlp(self, hidden_states, stashed_hs, inference_context=None):
         """
         Perform a forward pass through the feed-forward layer.
 
@@ -585,11 +594,11 @@ class DragonLayer(GraphableMegatronModule, BaseDragonLayer):
             bias_output = torch.stack(bias_chunks, dim=0).sum(dim=0) if bias_chunks else None
             mlp_output_with_bias = (mlp_output, bias_output)
         else:
-            mlp_output_with_bias = self.mlp(hidden_states)
+            mlp_output_with_bias = self.mlp(hidden_states, stashed_hs)
 
         nvtx_range_pop(suffix="mlp")
 
-        return mlp_output_with_bias[0]
+        return mlp_output_with_bias
 
     #@torch.compile # TODO: reactive. it's disabled during tests
     def _torch_compiled_headwise_norm(self, y_mixer):

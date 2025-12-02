@@ -24,13 +24,14 @@ from megatron.core.fusions.fused_bias_geglu import (
 from megatron.core.fusions.fused_bias_gelu import bias_gelu_impl
 from megatron.core.fusions.fused_bias_swiglu import bias_swiglu_impl, weighted_bias_swiglu_impl
 from megatron.core.transformer.module import MegatronModule
-from megatron.core.transformer.spec_utils import ModuleSpec, build_module
-from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.dragon.dragon_config import DragonConfig
 from megatron.core.utils import (
     get_tensor_model_parallel_group_if_none,
     nvtx_range_pop,
     nvtx_range_push,
 )
+from megatron.core.extensions.transformer_engine import TELinear, TENorm
+from megatron.core.activations import fast_gelu
 
 try:
     import transformer_engine  # pylint: disable=unused-import
@@ -42,21 +43,10 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
-
-# pylint: disable=missing-class-docstring
-@dataclass
-class MLPSubmodules:
-    """
-    The dataclass for ModuleSpecs of MLP submodules
-    including  linear fc1, activation function, linear fc2.
-    """
-
-    linear_fc1: Union[ModuleSpec, type] = None
-    activation_func: Union[ModuleSpec, type] = None
-    linear_fc2: Union[ModuleSpec, type] = None
+# TODO : need to make sure these are synced across the TP ranks!!!!!!!
 
 
-class MLP(MegatronModule):
+class DragonRouterMLP(MegatronModule):
     """
     MLP will take the input with h hidden state, project it to 4*h
     hidden dimension, perform nonlinear transformation, and project the
@@ -75,78 +65,94 @@ class MLP(MegatronModule):
 
     def __init__(
         self,
-        config: TransformerConfig,
-        submodules: MLPSubmodules,
-        is_expert: bool = False,
-        input_size: Optional[int] = None,
-        ffn_hidden_size: int = None,
-        tp_group: Optional[torch.distributed.ProcessGroup] = None,
+        config: DragonConfig,
     ):
         super().__init__(config=config)
 
-        self.config: TransformerConfig = config
+        self.config: DragonConfig = config
 
-        self.input_size = input_size if input_size != None else self.config.hidden_size
+        self.input_size = self.config.hidden_size
+        self.intermediate_size = self.input_size//8
+        self.output_size = self.config.num_moe_experts
 
-        tp_group = get_tensor_model_parallel_group_if_none(tp_group, is_expert=is_expert)
-        if ffn_hidden_size is None:
-            if is_expert:
-                raise ValueError("MoE MLP requires `ffn_hidden_size`, but it was not provided.")
-            warnings.warn(
-                "MLP requires ffn_hidden_size, but it was not provided. Using \
-                    config.ffn_hidden_size by default.",
-                DeprecationWarning,
-                stacklevel=2,
-            )
-            ffn_hidden_size = self.config.ffn_hidden_size
-
-        # If this is a gated linear unit we double the output width
-        # see https://arxiv.org/pdf/2002.05202.pdf
-        if self.config.gated_linear_unit:
-            ffn_hidden_size *= 2
-
-        self.linear_fc1 = build_module(
-            submodules.linear_fc1,
+        self.linear_down = TELinear(
             self.input_size,
-            ffn_hidden_size,
+            self.intermediate_size,
             config=self.config,
+            parallel_mode="duplicated",
             init_method=self.config.init_method,
-            gather_output=False,
-            bias=self.config.add_bias_linear,
+            bias=True,
             skip_bias_add=True,
-            is_expert=is_expert,
-            tp_comm_buffer_name="fc1",
-            tp_group=tp_group,
+            skip_weight_param_allocation=False,
+            tp_comm_buffer_name="down",
         )
 
-        if self.config.use_te_activation_func and not (submodules.activation_func is None):
-            self.activation_func = build_module(submodules.activation_func, config=self.config)
-        else:
-            self.activation_func = self.config.activation_func
+        self.eda_scalers = torch.nn.Parameter(torch.zeros(self.intermediate_size)) # TODO: official ZAYA does torch.ones. test
 
-        self.linear_fc2 = build_module(
-            submodules.linear_fc2,
-            self.config.ffn_hidden_size,
-            self.config.hidden_size,
+        self.eda_norm = TENorm(
             config=self.config,
-            init_method=self.config.output_layer_init_method,
-            bias=self.config.add_bias_linear,
-            input_is_parallel=True,
-            skip_bias_add=True,
-            is_expert=is_expert,
-            tp_comm_buffer_name="fc2",
-            tp_group=tp_group,
-            alpha=2/math.sqrt(5) if hasattr(self.config, 'use_uscaling') and self.config.use_uscaling else None,
+            hidden_size=self.intermediate_size,
+            eps=self.config.layernorm_epsilon,
         )
 
-    def forward(self, hidden_states, per_token_scale=None, stashed_hs=None):
-        """Perform the forward pass through the MLP block."""
+        self.linear_fc1 = TELinear(
+            self.intermediate_size,
+            self.intermediate_size,
+            config=self.config,
+            parallel_mode="duplicated",
+            init_method=self.config.init_method,
+            bias=True,
+            skip_bias_add=True,
+            skip_weight_param_allocation=False,
+            tp_comm_buffer_name="fc1",
+        )
+
+        self.linear_fc2 = TELinear(
+            self.intermediate_size,
+            self.intermediate_size,
+            config=self.config,
+            parallel_mode="duplicated",
+            init_method=self.config.init_method,
+            bias=True,
+            skip_bias_add=True,
+            skip_weight_param_allocation=False,
+            tp_comm_buffer_name="fc2",
+        )
+
+        self.linear_fc3 = TELinear(
+            self.intermediate_size,
+            self.output_size,
+            config=self.config,
+            parallel_mode="duplicated",
+            init_method=self.config.init_method,
+            bias=False,
+            skip_bias_add=True,
+            skip_weight_param_allocation=False,
+            tp_comm_buffer_name="fc3",
+        )
+
+        if self.config.use_te_activation_func:
+            self.activation_func = transformer_engine.pytorch.ops.GELU()
+        else:
+            self.activation_func = F.gelu
+
+    def forward(self, hidden_states, prev_hs=None, per_token_scale=None):
+        nvtx_range_push(suffix="linear_down")
+        intermediate_parallel, bias_parallel = self.linear_down(hidden_states)
+        nvtx_range_pop(suffix="linear_down")
+
+        print(self.linear_fc3.weight)
+
+        intermediate_parallel = self._torch_compiled_EDA(intermediate_parallel, bias_parallel, self.eda_scalers, prev_hs)
+        stashed_hs = intermediate_parallel.clone()
+        intermediate_parallel = self.eda_norm(intermediate_parallel)
+
         # [s, b, 4 * h/p]
         nvtx_range_push(suffix="linear_fc1")
-        intermediate_parallel, bias_parallel = self.linear_fc1(hidden_states)
+        intermediate_parallel, bias_parallel = self.linear_fc1(intermediate_parallel)
         nvtx_range_pop(suffix="linear_fc1")
 
-        nvtx_range_push(suffix="activation")
+        nvtx_range_push(suffix="activation1")
         if self.config.use_te_activation_func:
             if bias_parallel is not None:
                 intermediate_parallel = intermediate_parallel + bias_parallel
@@ -220,12 +226,92 @@ class MLP(MegatronModule):
                 original_dtype = intermediate_parallel.dtype
                 intermediate_parallel = intermediate_parallel * per_token_scale.unsqueeze(-1)
                 intermediate_parallel = intermediate_parallel.to(original_dtype)
-        nvtx_range_pop(suffix="activation")
+        nvtx_range_pop(suffix="activation1")
 
         # [s, b, h]
         nvtx_range_push(suffix="linear_fc2")
-        output, output_bias = self.linear_fc2(intermediate_parallel)
+        intermediate_parallel, bias_parallel = self.linear_fc2(intermediate_parallel)
         nvtx_range_pop(suffix="linear_fc2")
+
+        nvtx_range_push(suffix="activation2")
+        if self.config.use_te_activation_func:
+            if bias_parallel is not None:
+                intermediate_parallel = intermediate_parallel + bias_parallel
+            intermediate_parallel = self.activation_func(intermediate_parallel)
+            if per_token_scale is not None:
+                original_dtype = intermediate_parallel.dtype
+                intermediate_parallel = intermediate_parallel * per_token_scale.unsqueeze(-1)
+                intermediate_parallel = intermediate_parallel.to(original_dtype)
+        elif self.config.bias_activation_fusion:
+            if per_token_scale is not None:
+                if self.activation_func == F.silu and self.config.gated_linear_unit:
+                    # dtype is handled inside the fused kernel
+                    intermediate_parallel = weighted_bias_swiglu_impl(
+                        intermediate_parallel,
+                        bias_parallel,
+                        per_token_scale.unsqueeze(-1),
+                        self.config.activation_func_fp8_input_store,
+                    )
+                elif self.activation_func == quick_gelu and self.config.gated_linear_unit:
+                    intermediate_parallel = weighted_bias_quick_geglu_impl(
+                        intermediate_parallel,
+                        bias_parallel,
+                        per_token_scale.unsqueeze(-1),
+                        self.config.activation_func_fp8_input_store,
+                        self.config.glu_linear_offset,
+                        self.config.activation_func_clamp_value,
+                    )
+                else:
+                    raise ValueError(
+                        "Only support fusion of swiglu and quick_gelu with per_token_scale in MLP."
+                    )
+            else:
+                if self.activation_func == F.gelu:
+                    if self.config.gated_linear_unit:
+                        intermediate_parallel = bias_geglu_impl(
+                            intermediate_parallel, bias_parallel
+                        )
+                    else:
+                        assert self.config.add_bias_linear is True
+                        intermediate_parallel = bias_gelu_impl(intermediate_parallel, bias_parallel)
+                elif self.activation_func == F.silu and self.config.gated_linear_unit:
+                    intermediate_parallel = bias_swiglu_impl(
+                        intermediate_parallel,
+                        bias_parallel,
+                        self.config.activation_func_fp8_input_store,
+                        self.config.cpu_offloading
+                        and self.config.cpu_offloading_activations
+                        and HAVE_TE,
+                    )
+                else:
+                    raise ValueError("Only support fusion of gelu and swiglu")
+        else:
+            if bias_parallel is not None:
+                intermediate_parallel = intermediate_parallel + bias_parallel
+            if self.config.gated_linear_unit:
+
+                def glu(x):
+                    x_glu, x_linear = torch.chunk(x, 2, dim=-1)
+                    if (val := self.config.activation_func_clamp_value) is not None:
+                        x_glu = x_glu.clamp(min=None, max=val)
+                        x_linear = x_linear.clamp(min=-val, max=val)
+                    return self.config.activation_func(x_glu) * (
+                        x_linear + self.config.glu_linear_offset
+                    )
+
+                intermediate_parallel = glu(intermediate_parallel)
+            else:
+                intermediate_parallel = self.activation_func(intermediate_parallel)
+
+            if per_token_scale is not None:
+                original_dtype = intermediate_parallel.dtype
+                intermediate_parallel = intermediate_parallel * per_token_scale.unsqueeze(-1)
+                intermediate_parallel = intermediate_parallel.to(original_dtype)
+        nvtx_range_pop(suffix="activation2")
+
+        nvtx_range_push(suffix="linear_fc3")
+        output, output_bias = self.linear_fc3(intermediate_parallel)
+        nvtx_range_pop(suffix="linear_fc3")
 
         if per_token_scale is not None and output_bias is not None:
             # if this MLP is an expert, and bias is required, we add the bias to output directly
@@ -233,7 +319,14 @@ class MLP(MegatronModule):
             output += output_bias.unsqueeze(0) * per_token_scale.unsqueeze(-1)
             output_bias = None
 
-        return output, output_bias
+        return output, stashed_hs
+    
+    @torch.compile
+    def _torch_compiled_EDA(self, x, bias, lambd, x_prev=None):
+        if x_prev is not None:
+            return x + bias + lambd * x_prev
+        else:
+            return x + bias
 
     # pylint: disable=missing-function-docstring
     def sharded_state_dict(

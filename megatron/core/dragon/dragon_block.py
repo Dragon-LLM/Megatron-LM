@@ -698,6 +698,7 @@ class DragonBlock(GraphableMegatronModule, MegatronModule):
                     use_inner_quantization_context=use_inner_quantization_context,
                 )
             else:
+                stashed_hs = None
                 for l_no, layer in enumerate(self.layers):
                     # Get appropriate inner quantization context
                     if use_inner_quantization_context:
@@ -720,7 +721,7 @@ class DragonBlock(GraphableMegatronModule, MegatronModule):
                         )
 
                     with self.offload_context, inner_quantization_context:
-                        hidden_states = layer(
+                        hidden_states, stashed_hs = layer(
                             hidden_states=hidden_states,
                             attention_mask=attention_mask,
                             rotary_pos_emb=rotary_pos_emb,
@@ -729,13 +730,11 @@ class DragonBlock(GraphableMegatronModule, MegatronModule):
                             rotary_pos_cos_sin=rotary_pos_cos_sin,
                             attention_bias=attention_bias,
                             window_size=window_size,
+                            stashed_hs=stashed_hs,
                             inference_context=inference_context,
                             packed_seq_params=packed_seq_params,
                             sequence_len_offset=sequence_len_offset,
                         )
-
-                    """if l_no == 0:
-                        return hidden_states"""
 
                     if (
                         torch.is_grad_enabled()

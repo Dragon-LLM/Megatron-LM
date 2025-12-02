@@ -189,10 +189,11 @@ class Mamba3(MegatronModule):
             bias=False,
             skip_bias_add=False,
             skip_weight_param_allocation=False,
-            parallel_mode='duplicated', # duplicated across ranks. TODO: train and check that they are indeed synced across ranks.
+            parallel_mode='duplicated',
             is_expert=False,
             tp_comm_buffer_name='rope_proj',
         )
+        setattr(self.rope_proj.weight, "tp_sync", True)
 
         self.B_bias = nn.Parameter(torch.ones((self.mimo_dim, self.nheads_local_tp, self.d_state)), requires_grad=True)
         self.C_bias = nn.Parameter(torch.ones((self.mimo_dim, self.nheads_local_tp, self.d_state)), requires_grad=True)
@@ -210,6 +211,8 @@ class Mamba3(MegatronModule):
             config=self.config,
             eps=self.config.layernorm_epsilon,
         )
+        setattr(self.B_norm.weight, "tp_sync", True)
+        setattr(self.C_norm.weight, "tp_sync", True)
 
         # Initialize up/down MIMO projection (for x and z)
         in_proj_mimo_x_init_weights = torch.ones(self.dr_out_dim_local_tp, self.mimo_dim*self.mimo_proj_block_order, self.mimo_proj_block_order)
@@ -262,6 +265,7 @@ class Mamba3(MegatronModule):
             device=torch.cuda.current_device(),
             dtype=config.params_dtype,
         )
+        setattr(self.output_norm.weight, "tp_sync", True)
 
     def forward(
         self,

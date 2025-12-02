@@ -222,6 +222,8 @@ class GatedDeltaNet(MegatronModule):
                 ).uniform_(*self.A_init_range)
                 with torch.no_grad():
                     self.A_log.data.copy_(torch.log(A))
+                with torch.no_grad():
+                    self.conv1d.weight.normal_(0, self.config.init_std)
 
     def forward(
         self,

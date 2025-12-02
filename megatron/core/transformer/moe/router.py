@@ -21,7 +21,9 @@ from megatron.core.transformer.moe.moe_utils import (
     topk_routing_with_score_function,
     z_loss_func,
 )
+from megatron.core.dragon.dragon_router_mlp import DragonRouterMLP
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.dragon.dragon_config import DragonConfig
 
 
 class Router(ABC, MegatronModule):
@@ -47,17 +49,21 @@ class Router(ABC, MegatronModule):
         self.tp_cp_group = pg_collection.tp_cp
         self.tp_dp_cp_group = pg_collection.tp_dp_cp
 
-        # Initialize the gate weights.
-        # TODO: Add support for GPU initialization, which requires updating the golden values.
-        self.weight = torch.nn.Parameter(
-            torch.empty((self.config.num_moe_experts, self.config.hidden_size), dtype=torch.float32)
-        )
-        if self.config.add_bias_linear:
-            self.bias = torch.nn.Parameter(
-                torch.empty((self.config.num_moe_experts), dtype=torch.float32)
+        if not hasattr(self.config, 'moe_router_type') or self.config.moe_router_type == 'classic':
+            # Initialize the gate weights.
+            # TODO: Add support for GPU initialization, which requires updating the golden values.
+            self.weight = torch.nn.Parameter(
+                torch.empty((self.config.num_moe_experts, self.config.hidden_size), dtype=torch.float32)
             )
-        else:
-            self.bias = None
+            if self.config.add_bias_linear:
+                self.bias = torch.nn.Parameter(
+                    torch.empty((self.config.num_moe_experts), dtype=torch.float32)
+                )
+            else:
+                self.bias = None
+        elif self.config.moe_router_type == 'dragon':
+            self.dragon_router = DragonRouterMLP(config=self.config)
+
         # If calculate per token loss, we need to scale up moe aux loss by the number of tokens.
         # So we need to know if the model is configured to calculate per token loss.
         self.calculate_per_token_loss = self.config.calculate_per_token_loss
@@ -65,6 +71,10 @@ class Router(ABC, MegatronModule):
 
     def reset_parameters(self):
         """Reset the router parameters."""
+        if hasattr(self, 'dragon_router'):
+            for param in self.dragon_router.parameters():
+                setattr(param, 'sequence_parallel', self.config.sequence_parallel)
+            return
         if self.config.perform_initialization:
             self.config.init_method(self.weight)
             if self.bias is not None:
@@ -75,7 +85,7 @@ class Router(ABC, MegatronModule):
             self.bias.data = self.bias.data.to(dtype=self.config.params_dtype)
             setattr(self.bias, 'sequence_parallel', self.config.sequence_parallel)
 
-    def gating(self, input: torch.Tensor):
+    def gating(self, input: torch.Tensor, stashed_hs=None):
         """Forward pass of the router gate.
 
         Args:
@@ -84,6 +94,8 @@ class Router(ABC, MegatronModule):
         Returns:
             torch.Tensor: Logits tensor.
         """
+        if hasattr(self, 'dragon_router'):
+            return self.dragon_gating(input, stashed_hs)
         if self.weight.device.type == 'cpu':
             # move weights to GPU
             self.weight.data = self.weight.data.to(device=torch.cuda.current_device())
@@ -97,7 +109,11 @@ class Router(ABC, MegatronModule):
         elif self.config.moe_router_dtype == 'fp64':
             router_dtype = torch.float64
         logits = router_gating_linear(input, self.weight, self.bias, router_dtype)
-        return logits
+        return logits, None
+
+    def dragon_gating(self, input: torch.Tensor, stashed_hs=None):
+        logits, stashed_hs = self.dragon_router(input, stashed_hs)
+        return logits, stashed_hs
 
     @abstractmethod
     def routing(self, logits: torch.Tensor):
@@ -548,7 +564,7 @@ class TopKRouter(Router):
             self.global_tokens_per_expert.zero_()
             self.ga_steps.zero_()
 
-    def forward(self, input: torch.Tensor):
+    def forward(self, input: torch.Tensor, stashed_hs=None):
         """
         Forward pass of the router.
 
@@ -559,7 +575,7 @@ class TopKRouter(Router):
 
         # Apply input jitter
         input = self.apply_input_jitter(input)
-        logits = self.gating(input)
+        logits, stashed_hs = self.gating(input, stashed_hs)
 
         if self.config.moe_router_force_load_balancing:
             # Apply force load balancing with random logits for benchmark
@@ -567,7 +583,7 @@ class TopKRouter(Router):
 
         probs, routing_map = self.routing(logits)
 
-        return probs, routing_map
+        return probs, routing_map, stashed_hs
 
     def _load_from_state_dict(self, *args, **kwargs):
         """Load the state dict of the router."""

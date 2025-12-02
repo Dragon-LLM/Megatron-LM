@@ -83,6 +83,7 @@ from megatron.core.extensions.transformer_engine import TELinear, TELayerNormCol
 def get_dragon_block_spec(
     config: DragonConfig,
 ):
+    backend = TESpecProvider()
     attention = ModuleSpec(
         module=SelfDiffAttention,
         params={"attn_mask_type": AttnMaskType.causal if not config.intra_doc_masking else AttnMaskType.padding_causal},
@@ -115,7 +116,7 @@ def get_dragon_block_spec(
             submodules=MLPSubmodules(
                 linear_fc1=TEColumnParallelLinear, # no layernorm. it's done as a standalone.
                 linear_fc2=TERowParallelLinear,
-                activation_func=squared_relu,
+                activation_func=backend.activation_func() if config.use_te_activation_func else None,
             ),
         )
     else:
@@ -131,7 +132,7 @@ def get_dragon_block_spec(
             submodules=MLPSubmodules(
                 linear_fc1=TEColumnParallelLinear, # no layernorm. it's done as a standalone.
                 linear_fc2=TERowParallelLinear,
-                activation_func=squared_relu,
+                activation_func=backend.activation_func() if config.use_te_activation_func else None,
             ),
         )
         mlp = ModuleSpec(

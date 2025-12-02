@@ -187,7 +187,6 @@ class DiffAttention(MegatronModule, ABC):
             self.lambda_q2 = torch.nn.Parameter(torch.zeros(head_dim, dtype=torch.float32).normal_(mean=0,std=0.1))
             self.lambda_k2 = torch.nn.Parameter(torch.zeros(head_dim, dtype=torch.float32).normal_(mean=0,std=0.1))
         for p in [self.lambda_q1, self.lambda_k1, self.lambda_q2, self.lambda_k2]:
-            setattr(p, "tensor_model_parallel", True) # TODO: what does tensor_model_parallel do?
             setattr(p, "tp_sync", True)
 
         self.softcap = self.config.softcap_attn
@@ -1181,10 +1180,11 @@ class SelfDiffAttention(DiffAttention):
             bias=self.config.add_bias_linear,
             skip_bias_add=False,
             skip_weight_param_allocation=False,
-            parallel_mode='duplicated', # duplicated across ranks. TODO: train and check that they are synced across ranks.
+            parallel_mode='duplicated',
             is_expert=False,
             tp_comm_buffer_name='BkBv',
         )
+        setattr(self.linear_BkBv.weight, 'tp_sync', True)
 
         if submodules.q_layernorm is not None:
             self.q_layernorm = build_module(

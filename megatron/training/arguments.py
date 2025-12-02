@@ -1746,6 +1746,8 @@ def _add_dragon_args(parser):
     group.add_argument('--slw-warmup-steps', type=int, default=0)
     group.add_argument('--slw-start', type=int, default=0)
     group.add_argument('--slw-increment', type=int, default=0)
+    group.add_argument('--moe-router-type', type=str, default="classic")
+    group.add_argument("--no-mixer-gn", dest="mixer_gn", action="store_false")
 
     return parser
 
