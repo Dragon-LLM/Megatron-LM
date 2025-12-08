@@ -220,6 +220,7 @@ class DragonLayerSubmodules:
     mixer_proj: Union[ModuleSpec, type] = IdentityOp
     pre_mlp_norm: Union[ModuleSpec, type] = IdentityFuncOp
     mlp: Union[ModuleSpec, type] = IdentityOp
+    moe: Union[ModuleSpec, type] = IdentityOp
     # Mapping for sharded tensor keys to be applied in `sharded_state_dict` method
     sharded_state_dict_keys_map: Dict[str, str] = field(default_factory=dict)
 
@@ -251,7 +252,8 @@ class DragonLayer(GraphableMegatronModule, BaseDragonLayer):
         self,
         config: DragonConfig,
         submodules: DragonLayerSubmodules,
-        layer_type: str,
+        layer_mixer_type: str,
+        layer_mlp_type: str,
         layer_number: int = 1,
         pg_collection: Optional[ProcessGroupCollection] = None,
         vp_stage: Optional[int] = None,
@@ -268,7 +270,7 @@ class DragonLayer(GraphableMegatronModule, BaseDragonLayer):
         )
 
         # [Module 2: Mixer]
-        if layer_type == 'T':
+        if layer_mixer_type == 'T':
             attention_optional_kwargs = {}
             if config.context_parallel_size > 1 and config.cp_comm_type is not None:
                 if isinstance(config.cp_comm_type, list):
@@ -287,7 +289,7 @@ class DragonLayer(GraphableMegatronModule, BaseDragonLayer):
             num_mixer_heads = self.mixer.num_signal_heads
             num_mixer_heads_local = self.mixer.num_signal_heads_per_partition
             head_dim = self.mixer.val_hidden_size
-        elif layer_type == 'g':
+        elif layer_mixer_type == 'g':
             self.mixer = build_module(
                 submodules.gdn,
                 config=self.config,
@@ -297,7 +299,7 @@ class DragonLayer(GraphableMegatronModule, BaseDragonLayer):
             num_mixer_heads = self.mixer.num_heads
             num_mixer_heads_local = self.mixer.num_heads_local
             head_dim = self.mixer.value_head_dim
-        elif layer_type == '3':
+        elif layer_mixer_type == '3':
             self.mixer = build_module(
                 submodules.mamba3,
                 config=self.config,
@@ -307,7 +309,7 @@ class DragonLayer(GraphableMegatronModule, BaseDragonLayer):
             num_mixer_heads = self.mixer.nheads
             head_dim = self.mixer.head_dim
         else:
-            raise ValueError(f"Unsupported layer type: {layer_type}")
+            raise ValueError(f"Unsupported layer mixer type: {layer_mixer_type}")
 
         # [Module 3: Mixer norm]
         self.mixer_norm = build_module(
@@ -346,40 +348,22 @@ class DragonLayer(GraphableMegatronModule, BaseDragonLayer):
         )
 
         # [Module 4: MLP block]
-        additional_mlp_kwargs = {}
-        # import here to avoid circular import
-        from megatron.core.extensions.transformer_engine import TEFusedMLP
-        from megatron.core.transformer.moe.experts import GroupedMLP, SequentialMLP, TEGroupedMLP
-        from megatron.core.transformer.moe.moe_layer import MoELayer
+        if layer_mlp_type == 'd':
+            self.mlp = build_module(
+                submodules.mlp,
+                config=self.config,
+                tp_group=self.pg_collection.tp
+            )
+        elif layer_mlp_type == 'm':
+            self.mlp = build_module(
+                submodules.moe,
+                config=self.config,
+                pg_collection=pg_collection,
+            )
 
-        # MLP expects tp_group but MoELayer expects pg_collection to be passed in.
-        # We can change MLP to accept pg_collection but it makes the logic implicit
-        # The conditional below is to make the logic explicit
-        # if submodules.mlp is not a ModuleSpec,we dont have to handle passing additional kwargs
-        if isinstance(submodules.mlp, ModuleSpec):
-            if submodules.mlp.module in (MoELayer, GroupedMLP, TEGroupedMLP, SequentialMLP):
-                additional_mlp_kwargs["pg_collection"] = pg_collection
-            elif submodules.mlp.module == MLP:
-                assert hasattr(
-                    pg_collection, 'tp'
-                ), 'TP process group is required for MLP in TransformerLayer'
-                additional_mlp_kwargs["tp_group"] = pg_collection.tp
-            elif TEFusedMLP is not None and submodules.mlp.module == TEFusedMLP:
-                assert hasattr(
-                    pg_collection, 'tp'
-                ), 'TP process group is required for TEFusedMLP in TransformerLayer'
-                additional_mlp_kwargs["tp_group"] = pg_collection.tp
-            else:
-                log_single_rank(
-                    logger,
-                    logging.WARNING,
-                    f"Unknown MLP type: {type(submodules.mlp)}. Using default kwargs.",
-                )
-        self.mlp = build_module(submodules.mlp, config=self.config, **additional_mlp_kwargs)
         if hasattr(self.mlp, 'set_layer_number'):
             self.mlp.set_layer_number(self.layer_number)
-
-        self.is_moe_layer = isinstance(self.mlp, MoELayer)
+        self.is_moe_layer = layer_mlp_type == 'm'
 
         self.recompute_mlp = False
         if self.config.recompute_granularity == 'selective':
@@ -451,7 +435,7 @@ class DragonLayer(GraphableMegatronModule, BaseDragonLayer):
         hidden_states = self.pre_mlp_norm(residual)
         out = self._forward_mlp(hidden_states, stashed_hs, kwargs.get("inference_context", None))
         stashed_hs = None
-        if self.config.num_moe_experts is not None and self.config.num_moe_experts > 0:
+        if self.is_moe_layer:
             y_mlp = out[0]
             stashed_hs = out[3]
         else:

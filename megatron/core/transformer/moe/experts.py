@@ -817,6 +817,7 @@ class TEGroupedMLP(MegatronModule):
             self.activation_func = self.config.activation_func
 
         # TODO(Hepteract): pass pg_collection to submodule after refactoring Linear modules
+        alpha = 2/math.sqrt(5) if hasattr(self.config, 'use_uscaling') and self.config.use_uscaling else None
         self.linear_fc2 = build_module(
             submodules.linear_fc2,
             self.num_local_experts,
@@ -829,7 +830,8 @@ class TEGroupedMLP(MegatronModule):
             is_expert=True,
             tp_comm_buffer_name='fc2',
             tp_group=pg_collection.expt_tp,
-            alpha=2/math.sqrt(5) if hasattr(self.config, 'use_uscaling') and self.config.use_uscaling else None,
+            alpha_fwd=alpha,
+            alpha_bwd=alpha,
         )
 
         self.offload_expert_fc1 = (

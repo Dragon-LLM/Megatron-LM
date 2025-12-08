@@ -76,7 +76,10 @@ def _get_param_groups_uscaling(
                 assert hasattr(mod, "row_parallel")
                 size_mult = 1
                 if mod.row_parallel:
-                    size_mult = parallel_state.get_tensor_model_parallel_world_size()     
+                    if not isinstance(mod, te.pytorch.GroupedLinear):
+                        size_mult = parallel_state.get_tensor_model_parallel_world_size()
+                    else:
+                        size_mult = parallel_state.get_expert_tensor_parallel_world_size()
 
                 if isinstance(mod, te.pytorch.GroupedLinear):
                     is_grouped = True
@@ -109,8 +112,8 @@ def _get_param_groups_uscaling(
                         _wd_mult = 1.
                     _wd_mult = _wd_mult / (base_lr * _lr_mult) # truly decoupled weight decay
 
-                    #if parallel_state.get_data_parallel_rank() == 0 and parallel_state.get_tensor_model_parallel_rank() == 0:
-                    #    print(f"param {name}.{weight_attr} | shape {weight.shape} (multiplied: {size_mult}) | lr_mult={_lr_mult:.3e} | wd_mult={_wd_mult:.3e} | is_expert_parallel={is_expert_parallel}")
+                    if parallel_state.get_data_parallel_rank() == 0 and parallel_state.get_tensor_model_parallel_rank() == 0:
+                        print(f"param {name}.{weight_attr} | shape {weight.shape} (multiplied: {size_mult}) | lr_mult={_lr_mult:.3e} | wd_mult={_wd_mult:.3e} | is_expert_parallel={is_expert_parallel}")
 
                     key = (_wd_mult, _lr_mult, is_expert_parallel, is_decoupled_lr)
                     if key not in params_map:
@@ -150,6 +153,10 @@ def _get_param_groups_uscaling(
             if "embedding" in name:
                 _lr_mult = lr_mult_emb
                 _wd_mult = 0.
+            elif "router.weight" in name:
+                fan_in = size_mult * param.shape[1]
+                _lr_mult = 1 / math.sqrt(fan_in)
+                _wd_mult = 1.
             else:
                 _lr_mult = lr_mult_scalar
                 _wd_mult = 0.
@@ -164,8 +171,8 @@ def _get_param_groups_uscaling(
                 params_map[key] = []
             params_map[key].append(param)
 
-            #if parallel_state.get_data_parallel_rank() == 0 and parallel_state.get_tensor_model_parallel_rank() == 0:
-            #    print(f"param {name} | shape {param.shape} | lr_mult={_lr_mult:.3e} | wd_mult={_wd_mult:.3e} | is_expert_parallel={is_expert_parallel}")
+            if parallel_state.get_data_parallel_rank() == 0 and parallel_state.get_tensor_model_parallel_rank() == 0:
+                print(f"param {name} | shape {param.shape} | lr_mult={_lr_mult:.3e} | wd_mult={_wd_mult:.3e} | is_expert_parallel={is_expert_parallel}")
     
     # Distributed checkpoint requires all ranks to have the same param groups,
     # so we need to align the param groups across ranks, otherwise we may have

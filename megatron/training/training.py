@@ -89,7 +89,7 @@ from megatron.training.utils import get_batch_on_this_cp_rank, get_batch_on_this
 from megatron.legacy.data.data_samplers import build_pretraining_data_loader
 from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler
 from megatron.core.transformer.moe import upcycling_utils
-from megatron.core.transformer.moe.moe_utils import track_moe_metrics
+from megatron.core.transformer.moe.moe_utils import track_moe_metrics, track_moe_balance
 from megatron.core.transformer.multi_token_prediction import MTPLossLoggingHelper
 from megatron.core.parallel_state import (
     destroy_global_memory_buffer,
@@ -1010,6 +1010,8 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
             ),
             flush=True,
         )
+    
+    print_rank_0(model)
 
     # GPU allocation.
     # For FSDP2, we don't allocate GPU memory here. We allocate GPU memory
@@ -1497,6 +1499,7 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
 
 
 def training_log(
+    model,
     loss_dict,
     total_loss_dict,
     learning_rate,
@@ -1704,6 +1707,13 @@ def training_log(
             moe_layer_freq=args.moe_layer_freq,
             mtp_num_layers=args.mtp_num_layers,
         )
+        track_moe_balance(
+            model=model,
+            iteration=iteration,
+            writer=writer,
+            wandb_writer=wandb_writer,
+        )
+
     if args.mtp_num_layers is not None:
         mtp_loss_scale = 1 / get_num_microbatches()
         MTPLossLoggingHelper.track_mtp_metrics(
@@ -2538,6 +2548,7 @@ def train(
             else:
                 learning_rate = param_group['lr']
         report_memory_flag = training_log(
+            model,
             loss_dict,
             total_loss_dict,
             learning_rate,

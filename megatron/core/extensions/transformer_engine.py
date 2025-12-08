@@ -275,7 +275,8 @@ class TELinear(te.pytorch.Linear):
         is_expert: bool = False,
         symmetric_ar_type: Optional[str] = None,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
-        alpha: Optional[float] = None,
+        alpha_fwd: Optional[float] = None,
+        alpha_bwd: Optional[float] = None,
         uscaling_scaling: Optional[bool] = None,
     ):
         if not HAVE_TE:
@@ -301,11 +302,14 @@ class TELinear(te.pytorch.Linear):
                 "Transformer Engine linear layers do not support skip_weight_param_allocation"
             )
 
-        assert alpha != 0., "Alpha scaling factor cannot be zero, I mean wtf?"
-        self.alpha = alpha or 1.
+        assert alpha_fwd != 0., "Alpha scaling factor cannot be zero, I mean wtf?"
+        self.alpha_fwd = alpha_fwd or 1.
+        self.alpha_bwd = alpha_bwd or 1.
         if hasattr(config, 'use_uscaling') and (uscaling_scaling is not False):
             if config.use_uscaling:
-                self.alpha = self.alpha * 1./math.sqrt(input_size)
+                scale = 1./math.sqrt(input_size)
+                self.alpha_fwd = self.alpha_fwd * scale
+                self.alpha_bwd = self.alpha_bwd * scale
 
         extra_kwargs = _get_extra_te_kwargs(config)
 
@@ -440,17 +444,15 @@ class TELinear(te.pytorch.Linear):
         _is_first_microbatch = (
             None if self.disable_parameter_transpose_cache else self.is_first_microbatch
         )
-        out = super().forward(x, is_first_microbatch=_is_first_microbatch)
+        out = super().forward(x, is_first_microbatch=_is_first_microbatch, alpha_fwd=self.alpha_fwd, alpha_bwd=self.alpha_bwd)
         self.is_first_microbatch = False
 
         # TE only returns a tuple when return_bias is True, otherwise
         # it returns a single Tensor, we always want to return two
         # values regardless of the arguments.
         if self.te_return_bias:
-            out, b = out
-            out = self.alpha * out
-            return out, b
-        return self.alpha * out, None # TODO: make it more efficient than that
+            return out
+        return out, None
 
     def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
         """Replicate cross TP/DP."""
@@ -488,7 +490,8 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
         skip_weight_param_allocation: bool = False,
         tp_comm_buffer_name: Optional[str] = None,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
-        alpha: Optional[float] = None,
+        alpha_fwd: Optional[float] = None,
+        alpha_bwd: Optional[float] = None,
         uscaling_scaling: Optional[bool] = None,
     ):
         if not HAVE_TE:
@@ -511,11 +514,14 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
                 "Transformer Engine linear layers do not support skip_weight_param_allocation"
             )
 
-        assert alpha != 0., "Alpha scaling factor cannot be zero, I mean wtf?"
-        self.alpha = alpha or 1.
+        assert alpha_fwd != 0., "Alpha scaling factor cannot be zero, I mean wtf?"
+        self.alpha_fwd = alpha_fwd or 1.
+        self.alpha_bwd = alpha_bwd or 1.
         if hasattr(config, 'use_uscaling') and (uscaling_scaling is not False):
             if config.use_uscaling:
-                self.alpha = self.alpha * 1./math.sqrt(input_size)
+                scale = 1./math.sqrt(input_size)
+                self.alpha_fwd = self.alpha_fwd * scale
+                self.alpha_bwd = self.alpha_bwd * scale
 
         # TODO: For backward compatibility, remove in v0.15.
         tp_group = get_tensor_model_parallel_group_if_none(tp_group, is_expert=is_expert)
@@ -641,25 +647,19 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
         _is_first_microbatch = (
             None if self.disable_parameter_transpose_cache else self.is_first_microbatch
         )
-        out = super().forward(x, is_first_microbatch=_is_first_microbatch)
+        out = super().forward(x, is_first_microbatch=_is_first_microbatch, alpha_fwd=self.alpha_fwd, alpha_bwd=self.alpha_bwd)
         self.is_first_microbatch = False
 
         # TE only returns a tuple when return_bias is True, otherwise
         # it returns a single Tensor, we always want to return two
         # values regardless of the arguments.
+        bias = None
         if self.te_return_bias:
-            out, b = out
-            if self.te_return_layernorm_output:
-                out, ln_out = out
-                out = self.alpha * out
-                return (out, ln_out), b
-            out = self.alpha * out
-            return out, b
+            out, bias = out
         if self.te_return_layernorm_output:
             out, ln_out = out
-            out = self.alpha * out
-            return (out, ln_out), None
-        return self.alpha * out, None
+            out = (out, ln_out)
+        return out, bias
 
     def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
         """Sharding along axis 0, bias sharded"""
@@ -698,7 +698,8 @@ class TEColumnParallelLinear(TELinear):
         skip_weight_param_allocation: bool = False,
         tp_comm_buffer_name: Optional[str] = None,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
-        alpha: Optional[float] = None,
+        alpha_fwd: Optional[float] = None,
+        alpha_bwd: Optional[float] = None,
         uscaling_scaling: Optional[bool] = None,
     ):
         if not HAVE_TE:
@@ -730,7 +731,8 @@ class TEColumnParallelLinear(TELinear):
             tp_comm_buffer_name=tp_comm_buffer_name,
             symmetric_ar_type=config.symmetric_ar_type,
             tp_group=tp_group,
-            alpha=alpha,
+            alpha_fwd=alpha_fwd,
+            alpha_bwd=alpha_bwd,
             uscaling_scaling=uscaling_scaling,
         )
 
@@ -794,7 +796,8 @@ class TERowParallelLinear(TELinear):
         is_expert: bool,
         tp_comm_buffer_name: Optional[str] = None,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
-        alpha: Optional[float] = None,
+        alpha_fwd: Optional[float] = None,
+        alpha_bwd: Optional[float] = None,
         uscaling_scaling: Optional[bool] = None,
     ):
         if not HAVE_TE:
@@ -827,7 +830,8 @@ class TERowParallelLinear(TELinear):
             tp_comm_buffer_name=tp_comm_buffer_name,
             symmetric_ar_type=config.symmetric_ar_type,
             tp_group=tp_group,
-            alpha=alpha,
+            alpha_fwd=alpha_fwd,
+            alpha_bwd=alpha_bwd,
             uscaling_scaling=uscaling_scaling,
         )
         if config.use_cpu_initialization:
@@ -1164,7 +1168,8 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             is_expert: bool = False,
             tp_comm_buffer_name: Optional[str] = None,
             tp_group: Optional[torch.distributed.ProcessGroup] = None,
-            alpha: Optional[float] = None,
+            alpha_fwd: Optional[float] = None,
+            alpha_bwd: Optional[float] = None,
             uscaling_scaling: Optional[bool] = None,
         ):
             self.config = config
@@ -1189,11 +1194,14 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                         "Only TE with version >=2.3.0 supports delay_wgrad_compute now."
                     )
 
-            assert alpha != 0., "Alpha scaling factor cannot be zero, I mean wtf?"
-            self.alpha = alpha or 1.
+            assert alpha_fwd != 0., "Alpha scaling factor cannot be zero, I mean wtf?"
+            self.alpha_fwd = alpha_fwd or 1.
+            self.alpha_bwd = alpha_bwd or 1.
             if hasattr(config, 'use_uscaling') and (uscaling_scaling is not False):
                 if config.use_uscaling:
-                    self.alpha = self.alpha * 1./math.sqrt(input_size)
+                    scale = 1./math.sqrt(input_size)
+                    self.alpha_fwd = self.alpha_fwd * scale
+                    self.alpha_bwd = self.alpha_bwd * scale
 
             extra_kwargs["ub_name"] = tp_comm_buffer_name
 
@@ -1333,17 +1341,15 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             _is_first_microbatch = (
                 None if self.disable_parameter_transpose_cache else self.is_first_microbatch
             )
-            out = super().forward(x, m_splits, is_first_microbatch=_is_first_microbatch)
+            out = super().forward(x, m_splits, is_first_microbatch=_is_first_microbatch, alpha_fwd=self.alpha_fwd, alpha_bwd=self.alpha_bwd)
             self.is_first_microbatch = False
 
             # TE only returns a tuple when return_bias is True, otherwise
             # it returns a single Tensor, we always want to return two
             # values regardless of the arguments.
             if self.te_return_bias:
-                out, b = out
-                out = self.alpha * out
-                return out, b
-            return self.alpha * out, None
+                return out
+            return out, None
 
         def _encode_extra_state(self, state):
             # TE 2.0 changed the format of extra_state to be a byte tensor
@@ -1494,7 +1500,8 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             is_expert: bool,
             tp_comm_buffer_name: Optional[str] = None,
             tp_group: Optional[torch.distributed.ProcessGroup] = None,
-            alpha: Optional[float] = None,
+            alpha_fwd: Optional[float] = None,
+            alpha_bwd: Optional[float] = None,
             uscaling_scaling: Optional[bool] = None,
         ):
             super().__init__(
@@ -1509,7 +1516,8 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                 is_expert=is_expert,
                 tp_comm_buffer_name=tp_comm_buffer_name,
                 tp_group=tp_group,
-                alpha=alpha,
+                alpha_fwd=alpha_fwd,
+                alpha_bwd=alpha_bwd,
                 uscaling_scaling=uscaling_scaling,
             )
 
@@ -1544,7 +1552,8 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             is_expert: bool,
             tp_comm_buffer_name: Optional[str] = None,
             tp_group: Optional[torch.distributed.ProcessGroup] = None,
-            alpha: Optional[float] = None,
+            alpha_fwd: Optional[float] = None,
+            alpha_bwd: Optional[float] = None,
             uscaling_scaling: Optional[bool] = None,
         ):
             super().__init__(
@@ -1559,7 +1568,8 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                 is_expert=is_expert,
                 tp_comm_buffer_name=tp_comm_buffer_name,
                 tp_group=tp_group,
-                alpha=alpha,
+                alpha_fwd=alpha_fwd,
+                alpha_bwd=alpha_bwd,
                 uscaling_scaling=uscaling_scaling,
             )
 
@@ -2129,6 +2139,7 @@ try:
         layout: str = "TN",
         out: Optional[torch.Tensor] = None,
         bias: Optional[torch.Tensor] = None,
+        alpha: float = 1.0,
         grad: bool = False,
     ) -> List[torch.Tensor]:
         """
@@ -2146,6 +2157,7 @@ try:
             quantization_params=None,
             gelu=None,
             gelu_in=None,
+            alpha=alpha,
             accumulate=False,
             layout=layout,
             out=out,

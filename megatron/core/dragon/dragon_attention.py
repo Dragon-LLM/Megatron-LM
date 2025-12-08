@@ -30,6 +30,7 @@ from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     get_fine_grained_offloading_context,
 )
 from megatron.core.tensor_parallel import get_cuda_rng_tracker
+from megatron.core.tensor_parallel.mappings import gather_from_sequence_parallel_region
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import MegatronModule
@@ -481,15 +482,6 @@ class DiffAttention(MegatronModule, ABC):
         is "self-attn" or "cross-attn".
         """
 
-    @abstractmethod
-    def get_gate_tensor(
-        self, hidden_states
-    ):
-        """
-        This method needs to be implemented based on whether the derived class
-        is "self-attn" or "cross-attn".
-        """
-    
     @abstractmethod
     def normalize_qk(
         self, q, k
@@ -1184,7 +1176,18 @@ class SelfDiffAttention(DiffAttention):
             is_expert=False,
             tp_comm_buffer_name='BkBv',
         )
-        setattr(self.linear_BkBv.weight, 'tp_sync', True)
+        w = self.linear_BkBv.weight
+        b = getattr(self.linear_BkBv, "bias", None)
+        if self.config.sequence_parallel:
+            # doesnt see the same data => sum grads
+            setattr(w, 'tp_sync', True)
+            if b is not None:
+                setattr(b, 'tp_sync', True)
+        else:
+            # see the same data => avg grads
+            setattr(w, 'average_gradients_across_tp_domain', True)
+            if b is not None:
+                setattr(b, 'average_gradients_across_tp_domain', True)
 
         if submodules.q_layernorm is not None:
             self.q_layernorm = build_module(
@@ -1310,6 +1313,8 @@ class SelfDiffAttention(DiffAttention):
 
         # project to B_k, B_v (shared across TP ranks)
         mixed_BkBv, _ = self.linear_BkBv(normed_hidden_states) # [L, B, 2*r*Dk]
+        if self.config.sequence_parallel:
+            mixed_BkBv = gather_from_sequence_parallel_region(mixed_BkBv, group=self.pg_collection.tp)
         B_k, B_v = torch.split(mixed_BkBv, r * Dk, dim=-1) # [L, B, r*Dk], [L, B, r*Dk]
 
         # q: [L, B, H_local, dk], A_k: [L, B, H_local, r], alpha_k: [L, B, H_local, 1]
@@ -1321,14 +1326,6 @@ class SelfDiffAttention(DiffAttention):
             self.run_realtime_tests()
 
         return q, A_k, A_v, B_k, B_v, alpha_k, alpha_v, gate
-
-    def get_gate_tensor(self, hidden_states):
-        Dk = self.config.kv_channels
-        mixed_g, _ = self.linear_g(hidden_states) # [L, B, H_signal_local * Dk]
-        mixed_g = rearrange(mixed_g, "l b (h d) -> l b h d", h=self.num_signal_heads_per_partition)#.contiguous()
-        # split per head: [L, B, H_signal_local, Dk]
-        g = mixed_g[..., 0:Dk]
-        return g
 
     def normalize_qk(self, q, k):
         if self.q_layernorm is not None:

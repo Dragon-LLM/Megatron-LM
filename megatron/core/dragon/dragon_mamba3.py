@@ -17,6 +17,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
+from megatron.core.tensor_parallel.mappings import gather_from_sequence_parallel_region
 from megatron.core.dist_checkpointing import ShardedTensor
 from megatron.core.dist_checkpointing.mapping import ReplicaId, ShardedTensorFactory
 from megatron.core.inference.contexts import BaseInferenceContext
@@ -193,7 +194,18 @@ class Mamba3(MegatronModule):
             is_expert=False,
             tp_comm_buffer_name='rope_proj',
         )
-        setattr(self.rope_proj.weight, "tp_sync", True)
+        w = self.rope_proj.weight
+        b = getattr(self.rope_proj, "bias", None)
+        if self.config.sequence_parallel:
+            # doesnt see the same data => sum grads
+            setattr(w, 'tp_sync', True)
+            if b is not None:
+                setattr(b, 'tp_sync', True)
+        else:
+            # see the same data => avg grads
+            setattr(w, 'average_gradients_across_tp_domain', True)
+            if b is not None:
+                setattr(b, 'average_gradients_across_tp_domain', True)
 
         self.B_bias = nn.Parameter(torch.ones((self.mimo_dim, self.nheads_local_tp, self.d_state)), requires_grad=True)
         self.C_bias = nn.Parameter(torch.ones((self.mimo_dim, self.nheads_local_tp, self.d_state)), requires_grad=True)
@@ -344,6 +356,8 @@ class Mamba3(MegatronModule):
             C = C.repeat(1, 1, 1, n_repeat, 1) # (B, L, R, N, S)
 
         angle, _ = self.rope_proj(hidden_states.transpose(0, 1)) # (B, L, S)
+        if self.config.sequence_parallel:
+            angle = gather_from_sequence_parallel_region(angle, group=self.pg_collection.tp)
         angle = angle.unsqueeze(-2).expand(-1, -1, self.nheads_local_tp, -1) # (B, L, G, S)
         angle = angle_dt(angle, dt)
 

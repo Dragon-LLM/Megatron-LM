@@ -2,6 +2,7 @@
 
 from collections import OrderedDict
 from typing import Dict, Literal, Optional, Tuple
+import math
 
 import torch
 from torch import Tensor
@@ -243,7 +244,8 @@ class DragonModel(LanguageModule):
                 is_expert=False,
                 tp_comm_buffer_name="output_layer",
                 tp_group=self.pg_collection.tp,
-                alpha=1/config.hidden_size if config.use_uscaling else None, # TODO : correct backward scaler!!
+                alpha_fwd=1/config.hidden_size if config.use_uscaling else None,
+                alpha_bwd=1/math.sqrt(config.hidden_size) if config.use_uscaling else None,
                 uscaling_scaling=False,
             )
 

@@ -124,6 +124,7 @@ class MLP(MegatronModule):
         else:
             self.activation_func = self.config.activation_func
 
+        alpha = 2/math.sqrt(5) if hasattr(self.config, 'use_uscaling') and self.config.use_uscaling else None
         self.linear_fc2 = build_module(
             submodules.linear_fc2,
             self.config.ffn_hidden_size,
@@ -136,7 +137,8 @@ class MLP(MegatronModule):
             is_expert=is_expert,
             tp_comm_buffer_name="fc2",
             tp_group=tp_group,
-            alpha=2/math.sqrt(5) if hasattr(self.config, 'use_uscaling') and self.config.use_uscaling else None,
+            alpha_fwd=alpha,
+            alpha_bwd=alpha,
         )
 
     def forward(self, hidden_states, per_token_scale=None, stashed_hs=None):

@@ -2,6 +2,7 @@
 
 from abc import ABC, abstractmethod
 from typing import Optional
+import math
 
 import torch
 
@@ -108,7 +109,7 @@ class Router(ABC, MegatronModule):
             router_dtype = torch.float32
         elif self.config.moe_router_dtype == 'fp64':
             router_dtype = torch.float64
-        logits = router_gating_linear(input, self.weight, self.bias, router_dtype)
+        logits = router_gating_linear(input, self.weight, self.bias, 1/math.sqrt(self.weight.shape[1]), router_dtype)
         return logits, None
 
     def dragon_gating(self, input: torch.Tensor, stashed_hs=None):

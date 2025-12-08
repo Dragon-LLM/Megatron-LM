@@ -87,7 +87,7 @@ class DragonRouterMLP(MegatronModule):
             tp_comm_buffer_name="down",
         )
 
-        self.eda_scalers = torch.nn.Parameter(torch.zeros(self.intermediate_size)) # TODO: official ZAYA does torch.ones. test
+        self.eda_scalers = torch.nn.Parameter(torch.zeros(self.intermediate_size))
 
         self.eda_norm = TENorm(
             config=self.config,
@@ -140,8 +140,6 @@ class DragonRouterMLP(MegatronModule):
         nvtx_range_push(suffix="linear_down")
         intermediate_parallel, bias_parallel = self.linear_down(hidden_states)
         nvtx_range_pop(suffix="linear_down")
-
-        print(self.linear_fc3.weight)
 
         intermediate_parallel = self._torch_compiled_EDA(intermediate_parallel, bias_parallel, self.eda_scalers, prev_hs)
         stashed_hs = intermediate_parallel.clone()

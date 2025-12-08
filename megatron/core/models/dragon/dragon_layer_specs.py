@@ -110,39 +110,39 @@ def get_dragon_block_spec(
             rope_proj=TELinear,
         ),
     )
-    if config.num_moe_experts is None or config.num_moe_experts == 0:
-        mlp = ModuleSpec(
-            module=MLP,
-            submodules=MLPSubmodules(
-                linear_fc1=TEColumnParallelLinear, # no layernorm. it's done as a standalone.
-                linear_fc2=TERowParallelLinear,
-                activation_func=backend.activation_func() if config.use_te_activation_func else None,
-            ),
+    # MLP.
+    mlp = ModuleSpec(
+        module=MLP,
+        submodules=MLPSubmodules(
+            linear_fc1=TEColumnParallelLinear, # no layernorm. it's done as a standalone.
+            linear_fc2=TERowParallelLinear,
+            activation_func=backend.activation_func() if config.use_te_activation_func else None,
+        ),
+    )
+    # MoE.
+    experts = ModuleSpec(
+        module=TEGroupedMLP,
+        submodules=MLPSubmodules(
+            linear_fc1=TEColumnParallelGroupedLinear, # no layernorm. it's done as a standalone.
+            linear_fc2=TERowParallelGroupedLinear,
+        ),
+    )
+    shared_experts = ModuleSpec(
+        module=SharedExpertMLP,
+        submodules=MLPSubmodules(
+            linear_fc1=TEColumnParallelLinear, # no layernorm. it's done as a standalone.
+            linear_fc2=TERowParallelLinear,
+            activation_func=backend.activation_func() if config.use_te_activation_func else None,
+        ),
+    )
+    moe = ModuleSpec(
+        module=MoELayer,
+        params={},
+        submodules=MoESubmodules(
+            experts=experts,
+            shared_experts=shared_experts,
         )
-    else:
-        experts = ModuleSpec(
-            module=TEGroupedMLP,
-            submodules=MLPSubmodules(
-                linear_fc1=TEColumnParallelGroupedLinear, # no layernorm. it's done as a standalone.
-                linear_fc2=TERowParallelGroupedLinear,
-            ),
-        )
-        shared_experts = ModuleSpec(
-            module=SharedExpertMLP,
-            submodules=MLPSubmodules(
-                linear_fc1=TEColumnParallelLinear, # no layernorm. it's done as a standalone.
-                linear_fc2=TERowParallelLinear,
-                activation_func=backend.activation_func() if config.use_te_activation_func else None,
-            ),
-        )
-        mlp = ModuleSpec(
-            module=MoELayer,
-            params={},
-            submodules=MoESubmodules(
-                experts=experts,
-                shared_experts=shared_experts,
-            )
-        )
+    )
     layer = ModuleSpec(
         module=DragonLayer,
         params={},
@@ -154,10 +154,11 @@ def get_dragon_block_spec(
             mixer_proj=TERowParallelLinear,
             pre_mlp_norm=TENorm,
             mlp=mlp,
+            moe=moe,
         ),
     )
     dragon_block_spec = DragonBlockSubmodules(
-        layer_specs=[layer] * len(config.layers_config),
+        layer_specs=[layer] * config.num_layers,
         final_layer_norm=TENorm,
     )
 

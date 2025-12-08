@@ -9,6 +9,7 @@ import torch
 from megatron.core import parallel_state
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.cuda_graphs import is_graph_capturing
+from megatron.core.utils import get_attr_wrapped_model
 
 try:
     import transformer_engine as te  # pylint: disable=unused-import
@@ -853,6 +854,66 @@ def track_moe_metrics(
     clear_aux_losses_tracker()
 
 
+def track_moe_balance(
+    model: List[torch.nn.Module],
+    iteration: int,
+    writer,
+    wandb_writer=None,
+):
+    tokens_per_layer = {} # layer_id -> (n_experts,)
+    bias_per_layer = {}
+    for model_chunk in model:
+        for module in get_attr_wrapped_model(model_chunk, 'modules')():
+            if hasattr(module, 'expert_bias'):
+                layer_id = int(module.layer_number)
+                t = module.local_tokens_per_expert2.detach().clone()
+                b = module.expert_bias.detach().clone()
+                if layer_id in tokens_per_layer:
+                    assert False                    
+                else:
+                    tokens_per_layer[layer_id] = t
+                    bias_per_layer[layer_id] = b
+
+    if len(bias_per_layer) == 0:
+        return
+
+    layer_ids = sorted(bias_per_layer.keys())
+    stacked_tokens_per_expert = torch.stack([tokens_per_layer[i] for i in layer_ids], dim=0)
+    stacked_expert_bias = torch.stack([bias_per_layer[i] for i in layer_ids], dim=0)
+
+    if writer is not None:
+        # load (%) per layer per expert
+        tokens = stacked_tokens_per_expert.float()  # (n_layers, n_experts)
+        denom = tokens.sum(dim=1, keepdim=True).clamp_min(1.0)
+        load_pct = (tokens / denom) * 100.0
+        bias = stacked_expert_bias.float()
+
+        n_layers, n_experts = load_pct.shape
+
+        # TensorBoard: log scalars
+        for layer_i, layer_id in enumerate(layer_ids):
+            for expert_j in range(n_experts):
+                writer.add_scalar(
+                    f"moe_load_pct/layer_{layer_id}/expert_{expert_j}",
+                    load_pct[layer_i, expert_j].item(),
+                    iteration,
+                )
+                writer.add_scalar(
+                    f"moe_expert_bias/layer_{layer_id}/expert_{expert_j}",
+                    bias[layer_i, expert_j].item(),
+                    iteration,
+                )
+
+        # W&B: log scalars (batched into one dict)
+        if wandb_writer:
+            wb_log = {}
+            for layer_i, layer_id in enumerate(layer_ids):
+                for expert_j in range(n_experts):
+                    wb_log[f"moe_load_pct/layer_{layer_id}/expert_{expert_j}"] = load_pct[layer_i, expert_j].item()
+                    wb_log[f"moe_expert_bias/layer_{layer_id}/expert_{expert_j}"] = bias[layer_i, expert_j].item()
+            wandb_writer.log(wb_log, iteration)
+
+
 def get_updated_expert_bias(tokens_per_expert, expert_bias, expert_bias_update_rate):
     """Update expert bias for biased expert routing. See https://arxiv.org/abs/2408.15664v1#
 
@@ -949,12 +1010,13 @@ class RouterGatingLinearFunction(torch.autograd.Function):
 
     @staticmethod
     def forward(
-        ctx, inp: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor, router_dtype: torch.dtype
+        ctx, inp: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor, alpha: float, router_dtype: torch.dtype
     ):
         """
         Forward pass of the RouterGatingLinearFunction function.
         """
         ctx.save_for_backward(inp, weight, bias)
+        ctx.alpha = alpha
         ctx.router_dtype = router_dtype
         ctx.input_dtype = inp.dtype
         ctx.weight_dtype = weight.dtype
@@ -962,11 +1024,13 @@ class RouterGatingLinearFunction(torch.autograd.Function):
         inp = inp.view(-1, inp_shape[-1])
 
         if te_general_gemm is not None and router_dtype != torch.float64:
-            output = te_general_gemm(weight, inp, router_dtype, layout="TN", bias=bias)
+            output = te_general_gemm(weight, inp, router_dtype, layout="TN", bias=bias, alpha=alpha)
             output = output[0]
         elif bias is None:
+            assert False
             output = torch.mm(inp.to(router_dtype), weight.to(router_dtype).t())
         else:
+            assert False
             output = torch.addmm(
                 bias.to(router_dtype), inp.to(router_dtype), weight.to(router_dtype).t()
             )
@@ -987,31 +1051,32 @@ class RouterGatingLinearFunction(torch.autograd.Function):
 
         if te_general_gemm is not None and ctx.router_dtype != torch.float64:
             grad_input = te_general_gemm(
-                weight.to(ctx.router_dtype), grad_output, ctx.router_dtype, layout="NN", grad=True
+                weight.to(ctx.router_dtype), grad_output, ctx.router_dtype, layout="NN", grad=True, alpha=ctx.alpha,
             )
             grad_weight = te_general_gemm(
-                inp.to(ctx.router_dtype), grad_output, ctx.router_dtype, layout="NT", grad=True
+                inp.to(ctx.router_dtype), grad_output, ctx.router_dtype, layout="NT", grad=True, alpha=ctx.alpha,
             )
             grad_input = grad_input[0].to(ctx.input_dtype)
             grad_weight = grad_weight[0].to(ctx.weight_dtype)
         else:
+            assert False
             grad_input = torch.mm(grad_output, weight.to(ctx.router_dtype)).to(ctx.input_dtype)
             grad_weight = torch.mm(grad_output.t(), inp.to(ctx.router_dtype)).to(ctx.weight_dtype)
 
         grad_bias = grad_output.sum(dim=0).to(ctx.weight_dtype) if bias is not None else None
         grad_input = grad_input.view(*inp_shape)
-        return grad_input, grad_weight, grad_bias, None
+        return grad_input, grad_weight, grad_bias, None, None
 
 
 def router_gating_linear(
-    inp: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor, router_dtype: torch.dtype
+    inp: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor, alpha: float, router_dtype: torch.dtype
 ):
     """
     Customized linear layer for router gating.
     This linear layer accepts bfloat16 input and weight, and can return output with router_dtype.
     It can reduce the memory usage by avoiding saving the intermediate high precision tensors.
     """
-    return RouterGatingLinearFunction.apply(inp, weight, bias, router_dtype)
+    return RouterGatingLinearFunction.apply(inp, weight, bias, alpha, router_dtype)
 
 
 # TODO(Hepteract): delete the usage of the global parallel_state.

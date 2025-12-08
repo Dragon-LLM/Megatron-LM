@@ -59,7 +59,9 @@ class DragonConfig(ModelParallelConfig):
     mtp_loss_scaling_factor: Optional[float] = None
     """Weighting factor of Multi-Token Prediction (MTP) loss."""
 
-    layers_config: str = 'gggTggg'
+    layers_mixer_config: str = 'gggTggg'
+
+    num_first_mlp: int = 0
 
     num_layers_in_first_pipeline_stage: Optional[int] = None
     """Number of Dragon layers on first pipeline stage.
@@ -829,6 +831,8 @@ class DragonConfig(ModelParallelConfig):
                 f"num_attention_heads ({self.num_attention_heads}) must be a multiple of "
                 f"tensor_model_parallel_size ({self.tensor_model_parallel_size})."
             )
+
+        assert len(self.layers_mixer_config) == self.num_layers
 
         if self.ffn_hidden_size is None:
             self.ffn_hidden_size = 4 * self.hidden_size

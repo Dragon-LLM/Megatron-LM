@@ -300,6 +300,7 @@ def _update_router_expert_bias(model: List[torch.nn.Module], config: Transformer
     for model_chunk in model:
         for module in get_attr_wrapped_model(model_chunk, 'modules')():
             if hasattr(module, 'expert_bias'):
+                module.local_tokens_per_expert2 = module.local_tokens_per_expert.clone()
                 tokens_per_expert_list.append(module.local_tokens_per_expert)
                 expert_bias_list.append(module.expert_bias)
     # For hybrid models with both MoE and Dense layers, this list can be empty.

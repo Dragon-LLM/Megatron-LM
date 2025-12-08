@@ -122,6 +122,7 @@ class SharedExpertMLP(MLP):
         """Forward function"""
         output, _ = super().forward(hidden_states)
         if self.use_shared_expert_gate:
+            assert False, "not compatible with uP"
             logits = torch.nn.functional.linear(hidden_states, self.gate_weight)
             gate_score = torch.nn.functional.sigmoid(logits)
             output = output * gate_score

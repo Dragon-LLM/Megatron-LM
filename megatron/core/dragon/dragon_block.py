@@ -334,7 +334,7 @@ class DragonBlock(GraphableMegatronModule, MegatronModule):
         # if self.apply_query_key_layer_scaling:
         #     coeff = self.layer_number
         #     self.norm_factor *= coeff
-        def build_layer(layer_spec, layer_number, layer_type):
+        def build_layer(layer_spec, layer_number, layer_mixer_type, layer_mlp_type):
             global_layer_number = layer_number + get_dragon_layer_offset(
                 self.config, self.vp_stage, get_pg_rank(self.pg_collection.pp)
             )  # 1-based index
@@ -359,7 +359,8 @@ class DragonBlock(GraphableMegatronModule, MegatronModule):
                 module = build_module(
                     layer_spec,
                     config=layer_config,
-                    layer_type=layer_type,
+                    layer_mixer_type=layer_mixer_type,
+                    layer_mlp_type=layer_mlp_type,
                     layer_number=layer_number,
                     pg_collection=self.pg_collection,
                     vp_stage=self.vp_stage,
@@ -367,9 +368,14 @@ class DragonBlock(GraphableMegatronModule, MegatronModule):
             return module
 
         # offset is implicit in TransformerLayer
+        if (self.config.num_moe_experts or 0) > 0:
+            layers_mlp_config = list('m' * self.config.num_layers)
+            layers_mlp_config[: self.config.num_first_mlp] = ['d'] * self.config.num_first_mlp
+        else:
+            layers_mlp_config = list('d' * self.config.num_layers)
         self.layers = torch.nn.ModuleList(
             [
-                build_layer(layer_spec, i + 1, self.config.layers_config[i])
+                build_layer(layer_spec, i + 1, self.config.layers_mixer_config[i], layers_mlp_config[i])
                 for i, layer_spec in enumerate(self.submodules.layer_specs)
             ]
         )
