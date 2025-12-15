@@ -82,7 +82,7 @@ from megatron.core.rerun_state_machine import (
     RerunDataIterator,
     RerunMode,
 )
-from megatron.training.initialize import initialize_megatron
+from megatron.training.initialize import initialize_megatron, initialize_wandb
 from megatron.training.initialize import write_args_to_tensorboard
 from megatron.training.initialize import set_jit_fusion_options
 from megatron.training.utils import get_batch_on_this_cp_rank, get_batch_on_this_tp_rank
@@ -771,6 +771,9 @@ def pretrain(
     timers('model-and-optimizer-setup').stop()
     print_datetime('after model, optimizer, and learning rate ' 'scheduler are built')
     config = get_model_config(model[0])
+
+    # init wandb
+    initialize_wandb(args)
 
     # Data stuff.
     app_metrics['app_build_dataiters_start_time'] = one_logger_utils.get_timestamp_in_ms()
@@ -1705,14 +1708,16 @@ def training_log(
             track_names=track_names,
             num_layers=args.num_layers,
             moe_layer_freq=args.moe_layer_freq,
+            num_first_mlp_layers=args.num_first_mlp,
             mtp_num_layers=args.mtp_num_layers,
         )
-        track_moe_balance(
-            model=model,
-            iteration=iteration,
-            writer=writer,
-            wandb_writer=wandb_writer,
-        )
+        if iteration % 250 == 0:
+            track_moe_balance(
+                model=model,
+                iteration=iteration,
+                writer=writer,
+                wandb_writer=wandb_writer,
+            )
 
     if args.mtp_num_layers is not None:
         mtp_loss_scale = 1 / get_num_microbatches()

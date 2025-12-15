@@ -255,6 +255,8 @@ class DragonLayer(GraphableMegatronModule, BaseDragonLayer):
         layer_mixer_type: str,
         layer_mlp_type: str,
         layer_number: int = 1,
+        vocab_size: int = 50000,
+        use_ve: bool = False,
         pg_collection: Optional[ProcessGroupCollection] = None,
         vp_stage: Optional[int] = None,
     ):
@@ -284,6 +286,8 @@ class DragonLayer(GraphableMegatronModule, BaseDragonLayer):
                 submodules.attention,
                 config=self.config,
                 layer_number=self.layer_number,
+                vocab_size=vocab_size,
+                use_ve=use_ve,
                 **attention_optional_kwargs,
             )
             num_mixer_heads = self.mixer.num_signal_heads
@@ -294,6 +298,8 @@ class DragonLayer(GraphableMegatronModule, BaseDragonLayer):
                 submodules.gdn,
                 config=self.config,
                 layer_number=self.layer_number,
+                vocab_size=vocab_size,
+                use_ve=use_ve,
                 pg_collection=pg_collection,
             )
             num_mixer_heads = self.mixer.num_heads
@@ -304,10 +310,13 @@ class DragonLayer(GraphableMegatronModule, BaseDragonLayer):
                 submodules.mamba3,
                 config=self.config,
                 layer_number=self.layer_number,
+                vocab_size=vocab_size,
+                use_ve=use_ve,
                 pg_collection=pg_collection,
             )
             num_mixer_heads = self.mixer.nheads
-            head_dim = self.mixer.head_dim
+            num_mixer_heads_local = self.mixer.nheads_local_tp
+            head_dim = self.mixer.headdim
         else:
             raise ValueError(f"Unsupported layer mixer type: {layer_mixer_type}")
 
@@ -453,6 +462,7 @@ class DragonLayer(GraphableMegatronModule, BaseDragonLayer):
         rotary_pos_cos_sin: Optional[Tensor] = None,
         attention_bias: Optional[Tensor] = None,
         window_size: Optional[Tuple[int, int]] = None,
+        input_ids: Optional[Tensor] = None,
         inference_context: Optional[Any] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
         sequence_len_offset: Optional[Tensor] = None,
@@ -507,6 +517,7 @@ class DragonLayer(GraphableMegatronModule, BaseDragonLayer):
             rotary_pos_cos_sin=rotary_pos_cos_sin,
             attention_bias=attention_bias,
             window_size=window_size,
+            input_ids=input_ids,
             packed_seq_params=packed_seq_params,
             sequence_len_offset=sequence_len_offset,
         )
@@ -584,7 +595,7 @@ class DragonLayer(GraphableMegatronModule, BaseDragonLayer):
 
         return mlp_output_with_bias
 
-    #@torch.compile # TODO: reactive. it's disabled during tests
+    @torch.compile
     def _torch_compiled_headwise_norm(self, y_mixer):
         if not self.config.layernorm_zero_centered_gamma:
             y_mixer = self.mixer_norm(y_mixer) * self.mixer_norm_scalers
@@ -592,7 +603,7 @@ class DragonLayer(GraphableMegatronModule, BaseDragonLayer):
             y_mixer = self.mixer_norm(y_mixer) * (self.mixer_norm_scalers + 1.)
         return y_mixer
     
-    #@torch.compile # TODO: reactive. it's disabled during tests
+    @torch.compile
     def _torch_compiled_residual_write(self, residual, y_mixer, a, b):
         residual = a * residual + b * y_mixer
         return residual
@@ -611,7 +622,12 @@ class DragonLayer(GraphableMegatronModule, BaseDragonLayer):
         Returns:
             ShardedStateDict: A dictionary containing the sharded state of the transformer layer.
         """
-        sharded_state_dict = super().sharded_state_dict(prefix, sharded_offsets, metadata)
+        tensor_parallel_layers_axis_map = None
+        if self.config.mixer_gn:
+            tensor_parallel_layers_axis_map={
+                'mixer_norm_scalers': 2,
+            }
+        sharded_state_dict = super().sharded_state_dict(prefix, sharded_offsets, metadata, tensor_parallel_layers_axis_map)
         prefixed_map = {
             f'{prefix}{k}': f'{prefix}{v}'
             for k, v in self.submodules_config.sharded_state_dict_keys_map.items()

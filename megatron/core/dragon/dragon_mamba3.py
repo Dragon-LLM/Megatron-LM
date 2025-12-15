@@ -7,7 +7,6 @@
 
 import logging
 import math
-import warnings
 from dataclasses import dataclass, replace
 from typing import List, Optional, Tuple, Union
 from contextlib import nullcontext
@@ -18,8 +17,6 @@ import torch.nn.functional as F
 from torch import Tensor
 
 from megatron.core.tensor_parallel.mappings import gather_from_sequence_parallel_region
-from megatron.core.dist_checkpointing import ShardedTensor
-from megatron.core.dist_checkpointing.mapping import ReplicaId, ShardedTensorFactory
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
@@ -31,7 +28,7 @@ from megatron.core.transformer.utils import (
     make_sharded_tensors_for_checkpoint,
     sharded_state_dict_default,
 )
-from megatron.core.utils import deprecate_inference_params, log_single_rank
+from megatron.core.utils import deprecate_inference_params, log_single_rank, make_tp_sharded_tensor_for_checkpoint
 
 try:
     from dragon_mamba3_ops.mimo_variant.ssd_mimo import mamba_chunk_scan_discretized_fused_combined as mamba_mimo_chunk_scan_discretized_fused_combined
@@ -44,7 +41,7 @@ except ImportError:
     HAVE_MAMBA_SSM = False
 
 try:
-    from einops import rearrange, repeat
+    from einops import rearrange
 
     HAVE_EINOPS = True
 except ImportError:
@@ -52,6 +49,26 @@ except ImportError:
 
 
 logger = logging.getLogger(__name__)
+
+
+class ExtendedEmbedding(torch.nn.Embedding):
+    """
+    torch.nn.Embedding with sharded state dict.
+    """
+
+    def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
+        """Sharding along axis 1 (embedding dim)."""        
+        state_dict = self.state_dict(prefix="", keep_vars=True)
+        weight_prefix = f"{prefix}weight"
+        return {
+            weight_prefix: make_tp_sharded_tensor_for_checkpoint(
+                tensor=state_dict["weight"],
+                key=weight_prefix,
+                tp_axis=1,
+                allow_shape_mismatch=True,
+                prepend_offsets=sharded_offsets,
+            )
+        }
 
 class ExtendedRMSNorm(RMSNormGated):
     """
@@ -82,6 +99,8 @@ class Mamba3(MegatronModule):
         config: DragonConfig,
         submodules: Mamba3Submodules,
         layer_number: int,
+        vocab_size: int = 50000,
+        use_ve: bool = False,
         pg_collection: ProcessGroupCollection = None,
     ):
         if not HAVE_MAMBA_SSM:
@@ -99,8 +118,6 @@ class Mamba3(MegatronModule):
         self.d_model = config.hidden_size
         self.d_inner = int(2 * self.d_model)
         self.rope_fraction = self.config.mamba_rope_fraction
-        self.mimo_dim = self.config.mamba_mimo_dim
-        self.mimo_proj_block_order = self.config.mamba_mimo_proj_block_order
         self.A_floor = 1e-4
         self.chunk_size = 128
         assert pg_collection is not None, "pg_collection must be provided for Mamba3"
@@ -120,6 +137,8 @@ class Mamba3(MegatronModule):
         self.d_state = self.config.mamba_state_dim
         self.headdim = self.config.mamba_head_dim
         self.ngroups = self.config.mamba_num_groups
+        self.mimo_dim = self.config.mamba_mimo_dim
+        self.mimo_proj_block_order = self.config.mamba_mimo_proj_block_order
 
         assert self.d_state is not None and self.d_state > 0
         assert self.headdim is not None and self.headdim > 0
@@ -181,6 +200,19 @@ class Mamba3(MegatronModule):
         )
         # WARNING: A_proj was specified as "float32". here, we merge it with in_proj so it's no longer float32.
 
+        # VE embeddings and scalars
+        self.use_ve = use_ve
+        if use_ve:
+            self.ve_embedding = ExtendedEmbedding(
+                num_embeddings=vocab_size,
+                embedding_dim=self.ngroups_local_tp*self.d_inner_per_group,
+            )
+            with torch.no_grad():
+                self.ve_embedding.weight.normal_(mean=0.0, std=config.init_embedding_std)
+            setattr(self.ve_embedding.weight, 'tensor_model_parallel', True)
+            self.ve_scalars = torch.nn.Parameter(torch.zeros(self.ngroups_local_tp, self.d_inner_per_group, dtype=torch.float32))
+            setattr(self.ve_scalars, 'tensor_model_parallel', True)
+
         self.rope_proj = build_module(
             submodules.rope_proj,
             self.config.hidden_size,
@@ -237,8 +269,7 @@ class Mamba3(MegatronModule):
         setattr(self.in_proj_mimo_z, "tensor_model_parallel", True)
         setattr(self.out_proj_mimo, "tensor_model_parallel", True)
 
-        #with get_cuda_rng_tracker().fork(): # TODO TEMP
-        with nullcontext():
+        with get_cuda_rng_tracker().fork():
             dt_min = 0.001
             dt_max = 0.1
             dt_init_floor = 1e-4
@@ -291,6 +322,7 @@ class Mamba3(MegatronModule):
         rotary_pos_cos_sin: Optional[Tensor] = None,
         attention_bias: Optional[Tensor] = None,
         window_size: Optional[Tuple[int, int]] = None, # not used, for compatibility
+        input_ids: Optional[Tensor] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
         sequence_len_offset: Optional[int] = None,
         *,
@@ -326,6 +358,11 @@ class Mamba3(MegatronModule):
         A = rearrange(A, "b l G n -> b l (G n)")
         trap = rearrange(trap, "b l G n -> b l (G n)")
 
+        # value embeddings
+        if self.use_ve:
+            ve = self.ve_embedding(input_ids) # (B,S, G_local*D)
+            x = x + self.ve_scalars.view(1, 1, -1) * ve
+
         _A = -F.softplus(A.to(torch.float32)) # (B, L, N)
         _A = torch.clamp(_A, max=-self.A_floor)
         dt = F.softplus(dt + self.dt_bias) # (B, L, N)
@@ -342,6 +379,8 @@ class Mamba3(MegatronModule):
             x = rearrange(x, "b l (r d) -> b l r d", r=self.mimo_dim)
             z = rearrange(z, "b l g d -> b l (g d)")
             z = rearrange(z, "b l (r d) -> b l r d", r=self.mimo_dim)
+        
+        x = rearrange(x, "b l r (h p) -> b l r h p", p=self.headdim)
 
         B = rearrange(B, "b l (g r n) -> b l r g n", g=self.ngroups_local_tp, r=self.mimo_dim)
         C = rearrange(C, "b l (g r n) -> b l r g n", g=self.ngroups_local_tp, r=self.mimo_dim)    
@@ -355,15 +394,14 @@ class Mamba3(MegatronModule):
             B = B.repeat(1, 1, 1, n_repeat, 1) # (B, L, R, N, S)
             C = C.repeat(1, 1, 1, n_repeat, 1) # (B, L, R, N, S)
 
-        angle, _ = self.rope_proj(hidden_states.transpose(0, 1)) # (B, L, S)
+        angle, _ = self.rope_proj(hidden_states) # (L, B, S)
         if self.config.sequence_parallel:
             angle = gather_from_sequence_parallel_region(angle, group=self.pg_collection.tp)
+        angle = angle.transpose(0, 1) # (B, L, S)
         angle = angle.unsqueeze(-2).expand(-1, -1, self.nheads_local_tp, -1) # (B, L, G, S)
         angle = angle_dt(angle, dt)
 
         C, B, CB_sum = mimo_rotary_qk(q=C, k=B, angle=angle, bias_q=self.C_bias, bias_k=self.B_bias, conjugate=False, inplace=False)
-
-        x = rearrange(x, "b l r (h p) -> b l r h p", p=self.headdim)
 
         A = _A * dt
         gating_factor = dt # B, L, N
@@ -380,8 +418,6 @@ class Mamba3(MegatronModule):
 
         x_scalar = (gamma_arr*_alpha_arr + _beta_arr).to(torch.bfloat16)
 
-        z = rearrange(z, "b l r (h p) -> b l r h p", p=self.headdim)
-
         y = mamba_mimo_chunk_scan_discretized_fused_combined(
             x=x.bfloat16(),
             A=A.bfloat16(),
@@ -396,14 +432,12 @@ class Mamba3(MegatronModule):
         )
 
         y = rearrange(y, "b l r h p -> b l r (h p)")
-
-        z = rearrange(z, "b l r h p -> b l r (h p)")
         y = self.output_norm(y, z)
 
         # Perform MIMO down projection (mimo_rank*d_inner -> d_inner)
         y = rearrange(y, "b l r d -> b l (r d)")
         y = rearrange(y, "b l (g d) -> b l g d", g=self.mimo_dim*self.mimo_proj_block_order)
-        y = torch.einsum("blgd,drg->bldr", y.float(), self.out_proj_mimo) # TODO TEMP
+        y = torch.einsum("blgd,drg->bldr", y, self.out_proj_mimo)
         y = rearrange(y, "b l d r -> b l (d r)")
         y = rearrange(y, "b l (h d) -> b l h d", d=self.headdim)
 
@@ -414,16 +448,25 @@ class Mamba3(MegatronModule):
     def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
         """Provide a sharded state dictionary for distributed checkpointing."""
         sharded_state_dict = {}
+        axis_map = {
+            "dt_bias": 0,
+            "D": 0,
+            "B_bias": 1,
+            "C_bias": 1,
+            "in_proj_mimo_x": 0,
+            "in_proj_mimo_z": 0,
+            "out_proj_mimo": 0,
+        }
+        if self.use_ve:
+            axis_map.update({
+                've_scalars': 0,
+            })
         # Parameters
         self._save_to_state_dict(sharded_state_dict, "", keep_vars=True)
         sharded_state_dict = make_sharded_tensors_for_checkpoint(
             sharded_state_dict,
             prefix,
-            tensor_parallel_layers_axis_map={
-                "A_log": 0,
-                "dt_bias": 0,
-                "D": 0,
-            },  # parameters sharded across TP
+            tensor_parallel_layers_axis_map=axis_map, # parameters sharded across TP
             sharded_offsets=sharded_offsets,
         )
         # Submodules
@@ -434,89 +477,4 @@ class Mamba3(MegatronModule):
 
             sharded_state_dict.update(module_sharded_sd)
 
-        # At this point the TP sharding is correctly defined for each tensor, but some of the
-        # tensors must be additionally split into separate parts
-        in_proj_dim = (
-            self.d_inner_local_tp * 2
-            + 2 * self.ngroups_local_tp * self.d_state
-            + self.nheads_local_tp
-        )
-        assert sharded_state_dict[f"{prefix}in_proj.weight"].data.size(0) == in_proj_dim, (
-            in_proj_dim,
-            sharded_state_dict[f"{prefix}in_proj.weight"],
-        )
-
-        sharded_state_dict[f"{prefix}in_proj.weight"] = _split_tensor_factory(
-            sharded_state_dict[f"{prefix}in_proj.weight"],
-            [
-                self.d_inner_local_tp,
-                self.d_inner_local_tp,
-                self.ngroups_local_tp * self.d_state,
-                self.ngroups_local_tp * self.d_state,
-                self.nheads_local_tp,
-            ],
-            ["z", "x", "B", "C", "dt"],
-            0,
-        )
-
         return sharded_state_dict
-
-
-def _split_tensor_factory(
-    orig_sh_ten: ShardedTensor, split_sections: List[int], split_names: List[str], split_dim: int
-) -> ShardedTensorFactory:
-    """Builds a factory that splits a given ShardedTensor into several independent chunks."""
-    assert isinstance(orig_sh_ten, ShardedTensor), type(orig_sh_ten)
-    orig_sh_ten_no_data = orig_sh_ten.without_data()  # remove `data` reference
-
-    if sum(split_sections) != orig_sh_ten_no_data.local_shape[split_dim]:
-        raise ValueError(
-            f"Split sections must cover the whole dimension size, "
-            f"got {split_sections=} vs dimensions size "
-            f"{orig_sh_ten_no_data.local_shape[split_dim]}"
-        )
-
-    assert not isinstance(
-        split_sections, int
-    ), "Splitting into predefined section sizes is supported (`split_sections` must be a list)"
-    assert len(split_sections) == len(split_names), (len(split_sections), len(split_names))
-
-    @torch.no_grad()
-    def sh_ten_build_fn(
-        key: str, t: torch.Tensor, replica_id: ReplicaId, flattened_range: Optional[slice]
-    ):
-        factory_sh_ten = replace(
-            orig_sh_ten_no_data,
-            key=key,
-            data=t,
-            dtype=t.dtype,
-            replica_id=replica_id,
-            flattened_range=flattened_range,
-        )
-
-        chunk_sh_tens = []
-        split_start = 0
-        for split_size, split_name in zip(split_sections, split_names):
-            split_chunks = factory_sh_ten.narrow(split_dim, split_start, split_size)
-            for sh_ten in split_chunks:
-                sh_ten.key = f"{sh_ten.key}.{split_name}"
-            chunk_sh_tens.extend(split_chunks)
-            split_start += split_size
-
-        assert split_start == orig_sh_ten_no_data.local_shape[split_dim], (
-            split_start,
-            orig_sh_ten_no_data.local_shape[split_dim],
-        )
-        assert sum(sh_ten.data.numel() for sh_ten in chunk_sh_tens) == t.numel(), (
-            chunk_sh_tens,
-            t.shape,
-        )
-        return chunk_sh_tens
-
-    @torch.no_grad()
-    def sh_ten_merge_fn(sub_state_dict):
-        return torch.cat(sub_state_dict)
-
-    return ShardedTensorFactory(
-        orig_sh_ten.key, orig_sh_ten.data, sh_ten_build_fn, sh_ten_merge_fn, orig_sh_ten.replica_id
-    )

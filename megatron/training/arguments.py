@@ -1731,9 +1731,10 @@ def _add_dragon_args(parser):
     group.add_argument('--lr-mult-emb', type=float, default=0.1)
     group.add_argument('--lr-mult-scalar', type=float, default=0.1)
     group.add_argument('--lr-mult-head', type=float, default=0.1)
-    #group.add_argument('--num-attention-layers', type=int, default=4)
     group.add_argument('--layers-mixer-config', type=str, default='gggTggg')
     group.add_argument('--num-first-mlp', type=int, default=0)
+    group.add_argument('--use-value-embeddings', action='store_true')
+    group.add_argument('--layers-ve-config', type=str, default='0001000')
     group.add_argument('--num-signal-heads', type=int, default=12)
     group.add_argument('--tpa-rank', type=int, default=4)
     group.add_argument('--token-shift', action='store_true')
@@ -1749,6 +1750,7 @@ def _add_dragon_args(parser):
     group.add_argument('--slw-increment', type=int, default=0)
     group.add_argument('--moe-router-type', type=str, default="classic")
     group.add_argument("--no-mixer-gn", dest="mixer_gn", action="store_false")
+    group.add_argument('--reset-training', action='store_true')
 
     return parser
 
@@ -1941,6 +1943,8 @@ def _add_logging_args(parser):
                        help='The wandb experiment name.')
     group.add_argument('--wandb-save-dir', type=str, default='',
                        help='Path to save the wandb results locally.')
+    group.add_argument('--wandb-fork-from-id', type=str, default=None, help='id of the wandb run to fork from.')
+    group.add_argument('--wandb-fork-from-step', type=int, default=None, help='step to fork from.')
     group.add_argument('--logging-level', type=int, default=None,
                        help='Set default logging level')
     return parser
@@ -3438,6 +3442,8 @@ def _add_experimental_args(parser):
                        help='Number of heads for Mamba layers.'
                        'If not set, then the number of heads will be '
                        '--hidden-size * expand // --mamba-head-dim')
+    group.add_argument('--mamba-mimo-dim', type=int, default=4)
+    group.add_argument('--mamba-mimo-proj-block-order', type=int, default=1)
     group.add_argument('--is-hybrid-model', default=False, action="store_true",
                        help='Indicates whether the model is a hybrid model.')
     group.add_argument('--disable-mamba-mem-eff-path', default=False, action="store_true",

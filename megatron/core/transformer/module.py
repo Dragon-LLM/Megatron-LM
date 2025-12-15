@@ -59,6 +59,7 @@ class MegatronModule(torch.nn.Module):
         prefix: str = '',
         sharded_offsets: Tuple[Tuple[int, int, int]] = (),
         metadata: Optional[dict] = None,
+        tensor_parallel_layers_axis_map = None,
     ) -> ShardedStateDict:
         """Default implementation for sharded state dict for distributed checkpointing.
 
@@ -79,7 +80,7 @@ class MegatronModule(torch.nn.Module):
         # Save parameters
         self._save_to_state_dict(sharded_state_dict, '', keep_vars=True)
         sharded_state_dict = make_sharded_tensors_for_checkpoint(
-            sharded_state_dict, prefix, sharded_offsets=sharded_offsets
+            sharded_state_dict, prefix, tensor_parallel_layers_axis_map=tensor_parallel_layers_axis_map, sharded_offsets=sharded_offsets
         )
         # Recurse into submodules
         for name, module in self.named_children():

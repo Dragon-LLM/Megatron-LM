@@ -17,8 +17,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
-from megatron.core.dist_checkpointing import ShardedTensor
-from megatron.core.dist_checkpointing.mapping import ReplicaId, ShardedTensorFactory
 from megatron.core.fp8_utils import get_fp8_align_size
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.packed_seq_params import PackedSeqParams
@@ -31,12 +29,11 @@ from megatron.core.transformer.utils import (
     make_sharded_tensors_for_checkpoint,
     sharded_state_dict_default,
 )
-from megatron.core.utils import deprecate_inference_params, nvtx_range_pop, nvtx_range_push
+from megatron.core.utils import deprecate_inference_params, nvtx_range_pop, nvtx_range_push, make_tp_sharded_tensor_for_checkpoint
 
 from .dragon_config import DragonConfig
 
 # TODO : state passing
-# TODO : uscaling
 
 try:
     from fla.ops.gated_delta_rule import chunk_gated_delta_rule
@@ -56,6 +53,25 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+
+class ExtendedEmbedding(torch.nn.Embedding):
+    """
+    torch.nn.Embedding with sharded state dict.
+    """
+
+    def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
+        """Sharding along axis 1 (embedding dim)."""        
+        state_dict = self.state_dict(prefix="", keep_vars=True)
+        weight_prefix = f"{prefix}weight"
+        return {
+            weight_prefix: make_tp_sharded_tensor_for_checkpoint(
+                tensor=state_dict["weight"],
+                key=weight_prefix,
+                tp_axis=1,
+                allow_shape_mismatch=True,
+                prepend_offsets=sharded_offsets,
+            )
+        }
 
 @dataclass
 class GatedDeltaNetSubmodules:
@@ -77,6 +93,8 @@ class GatedDeltaNet(MegatronModule):
         config: DragonConfig,
         submodules: GatedDeltaNetSubmodules,
         layer_number: int = None,
+        vocab_size: int = 50000,
+        use_ve: bool = False,
         bias: bool = False,
         conv_bias: bool = False,
         conv_init: Optional[float] = None,
@@ -151,9 +169,21 @@ class GatedDeltaNet(MegatronModule):
             tp_group=self.pg_collection.tp,
         )
 
+        # VE embeddings and scalars
+        self.use_ve = use_ve
+        if use_ve:
+            self.ve_embedding = ExtendedEmbedding(
+                num_embeddings=vocab_size,
+                embedding_dim=self.num_heads_local*self.value_head_dim,
+            )
+            with torch.no_grad():
+                self.ve_embedding.weight.normal_(mean=0.0, std=config.init_embedding_std)
+            setattr(self.ve_embedding.weight, 'tensor_model_parallel', True)
+            self.ve_scalars = torch.nn.Parameter(torch.zeros(self.num_heads_local, self.value_head_dim, dtype=torch.float32))
+            setattr(self.ve_scalars, 'tensor_model_parallel', True)
+
         self.conv_dim = self.qk_dim * 2 + self.v_dim
         self.conv_dim_local_tp = self.conv_dim // self.tp_size
-
         # weight shape: [conv_dim, 1, d_conv]
         # bias shape: [conv_dim]
         self.conv1d = nn.Conv1d(
@@ -237,6 +267,7 @@ class GatedDeltaNet(MegatronModule):
         rotary_pos_cos_sin: Optional[Tensor] = None,
         attention_bias: Optional[Tensor] = None,
         window_size: Optional[Tuple[int, int]] = None, # not used, for compatibility
+        input_ids: Optional[Tensor] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
         sequence_len_offset: Optional[int] = None,
         *,
@@ -292,13 +323,20 @@ class GatedDeltaNet(MegatronModule):
         beta = qkvzba[..., accum:accum+1].squeeze(-1); accum += 1
         alpha = qkvzba[..., accum:accum+1].squeeze(-1)
 
+        # value embeddings
+        if self.use_ve:
+            dk, dv = self.key_head_dim, self.value_head_dim
+            q, k, v = qkv.split([dk, dk, dv], dim=-1)
+            ve = self.ve_embedding(input_ids) # (B,S, H_noise_local*D)
+            v = v + self.ve_scalars * ve.view_as(v)
+            qkv = torch.cat((q, k, v), dim=-1)
+
         # qkv: (B, L, H_local, D)
         # gate: (B, L, H_local, Dv)
         # beta: (B, L, H_local)
         # alpha: (B, L, H_local)
 
         # Convolution on qkv
-        #qkv = rearrange(qkv, 'b l h d -> b (h d) l')
         qkv = rearrange(qkv, 'b l h d -> b l (h d)')
         qkv = qkv.transpose(1, 2)
         nvtx_range_push(suffix="conv1d")
@@ -373,15 +411,20 @@ class GatedDeltaNet(MegatronModule):
     def sharded_state_dict(self, prefix='', sharded_offsets=(), metadata=None):
         """Provide a sharded state dictionary for distributed checkpointing."""
         sharded_state_dict = {}
+        axis_map = {
+            'A_log': 0,
+            'dt_bias': 0,
+        }
+        if self.use_ve:
+            axis_map.update({
+                've_scalars': 0,
+            })
         # Parameters
         self._save_to_state_dict(sharded_state_dict, '', keep_vars=True)
         sharded_state_dict = make_sharded_tensors_for_checkpoint(
             sharded_state_dict,
             prefix,
-            tensor_parallel_layers_axis_map={
-                'A_log': 0,
-                'dt_bias': 0,
-            },  # parameters sharded across TP
+            tensor_parallel_layers_axis_map=axis_map, # parameters sharded across TP
             sharded_offsets=sharded_offsets,
         )
         # Submodules

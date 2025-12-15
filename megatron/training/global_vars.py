@@ -99,7 +99,6 @@ def set_global_variables(args, build_tokenizer=True):
     if build_tokenizer:
         _ = _build_tokenizer(args)
     _set_tensorboard_writer(args)
-    _set_wandb_writer(args)
     _set_one_logger(args)
     _set_adlr_autoresume(args)
     _set_timers(args)
@@ -182,7 +181,7 @@ def _set_tensorboard_writer(args):
                   'no TensorBoard logs will be written.', flush=True)
 
 
-def _set_wandb_writer(args):
+def set_wandb_writer(args):
     global _GLOBAL_WANDB_WRITER
     _ensure_var_is_not_initialized(_GLOBAL_WANDB_WRITER,
                                    'wandb writer')
@@ -209,6 +208,11 @@ def _set_wandb_writer(args):
             'config': wandb_config}
         if args.wandb_entity:
             wandb_kwargs['entity'] = args.wandb_entity
+        if args.wandb_fork_from_id and args.wandb_fork_from_step is not None:
+            print(f"\n> forking wandb from {args.wandb_fork_from_id} at step {args.wandb_fork_from_step}")
+            wandb_kwargs['fork_from'] = f'{args.wandb_fork_from_id}?_step={args.wandb_fork_from_step-5}'
+        else:
+            print("\n> not forking wandb")
         os.makedirs(wandb_kwargs['dir'], exist_ok=True)
         wandb.init(**wandb_kwargs)
         _GLOBAL_WANDB_WRITER = wandb

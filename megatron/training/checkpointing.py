@@ -423,6 +423,19 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
     # Only rank zero of the data parallel writes to the disk.
     model = unwrap_model(model)
 
+    world_sz  = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
+    src_rank  = world_sz - 1
+    wandb_id, last_step = None, None
+    if not torch.distributed.is_initialized or is_last_rank():
+        writer      = wandb_utils.get_wandb_writer()
+        if writer is not None and writer.run is not None:
+            wandb_id      = writer.run.id
+            last_step   = writer.run.step
+    payload = [wandb_id, last_step]
+    if torch.distributed.is_initialized():
+        torch.distributed.broadcast_object_list(payload, src=src_rank)
+    wandb_id, last_step = payload
+
     # Handle non_persistent_ckpt flag. Besides overwriting `args.save` and
     # `args.use_dist_ckpt`, non-persistent global ckpt requires no additional logic
     ckpt_type = CheckpointType.GLOBAL if args.use_dist_ckpt else CheckpointType.LEGACY
@@ -517,6 +530,8 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
             optim_sd_kwargs=dict(metadata=sharded_sd_metadata),
             model_sd_kwargs=dict(metadata=sharded_sd_metadata),
             rerun_state=rerun_state,
+            wandb_id=wandb_id,
+            wandb_step=last_step,
         )
 
         state_dict['num_floating_point_operations_so_far'] = num_floating_point_operations_so_far
@@ -798,6 +813,8 @@ def generate_state_dict(
     optim_sd_kwargs=None,
     model_sd_kwargs=None,
     rerun_state=None,
+    wandb_id=None,
+    wandb_step=None,
 ):
     """Generate a state dict from given model, optimizer, scheduler, rng state and others. """
 
@@ -805,6 +822,9 @@ def generate_state_dict(
     state_dict = {}
     state_dict['args'] = args
     state_dict['checkpoint_version'] = 3.0
+    state_dict['wsize'] = opt_param_scheduler.get_wsize() if opt_param_scheduler is not None else None
+    state_dict['wandb_id'] = wandb_id
+    state_dict['wandb_step'] = wandb_step
     if iteration is not None:
         state_dict['iteration'] = iteration
 
@@ -1579,7 +1599,7 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
             rng_state=gen_sd_rng_state,
             optim_sd_kwargs=optim_sd_kwargs,
             rerun_state=gen_sd_rerun_state,
-            iteration=1,
+            iteration=iteration,
         )
         state_dict["_model"] = model
         load_kwargs["sharded_state_dict"] = state_dict
@@ -1588,6 +1608,15 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
         load_dir, args, rank0=False, checkpointing_context=checkpointing_context,
         **load_kwargs
     )
+
+    if state_dict is not None:
+        if not args.reset_training:
+            args.wandb_fork_from_id = getattr(args, 'wandb_fork_from_id', None) or state_dict.get('wandb_id')
+            args.wandb_fork_from_step = getattr(args, 'wandb_fork_from_step', None) or state_dict.get('wandb_step')
+        else:
+            print("Reset training: will not fork wandb from previous checkpoint")
+            args.wandb_fork_from_id = None
+            args.wandb_fork_from_step = None
 
     # Checkpoint not loaded.
     if state_dict is None:

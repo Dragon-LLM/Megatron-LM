@@ -585,8 +585,14 @@ def topk_routing_with_score_function(
     if score_function == "softmax":
         if use_pre_softmax:
             scores = torch.softmax(logits, dim=-1, dtype=torch.float32).type_as(logits)
-            probs, top_indices = compute_topk(scores, topk, num_groups, group_topk)
+            if expert_bias is not None:
+                scores_for_routing = scores + expert_bias
+                _, top_indices = compute_topk(scores_for_routing, topk, num_groups, group_topk)
+                probs = torch.gather(scores, dim=1, index=top_indices).type_as(logits)
+            else:
+                probs, top_indices = compute_topk(scores, topk, num_groups, group_topk)
         else:
+            assert expert_bias is None, "expert_bias is only supported with use_pre_softmax=True"
             scores, top_indices = compute_topk(logits, topk, num_groups, group_topk)
             probs = torch.softmax(scores, dim=-1, dtype=torch.float32).type_as(logits)
     elif score_function == "sigmoid":
@@ -790,6 +796,7 @@ def track_moe_metrics(
     track_names: Optional[List[str]] = None,
     num_layers: Optional[int] = None,
     moe_layer_freq: Optional[Union[int, List[int]]] = None,
+    num_first_mlp_layers: int = 0, 
     mtp_num_layers: Optional[int] = None,
 ):
     """Track the MoE metrics for logging."""
@@ -817,6 +824,7 @@ def track_moe_metrics(
         num_moe_layers = sum(moe_layer_freq)
     else:
         raise ValueError(f"Invalid moe_layer_freq: {moe_layer_freq}")
+    num_moe_layers = num_moe_layers - num_first_mlp_layers
 
     if mtp_num_layers is not None:
         num_moe_layers += mtp_num_layers

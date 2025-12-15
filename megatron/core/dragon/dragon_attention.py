@@ -34,6 +34,10 @@ from megatron.core.tensor_parallel.mappings import gather_from_sequence_parallel
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import MegatronModule
+from megatron.core.transformer.utils import (
+    make_sharded_tensors_for_checkpoint,
+    sharded_state_dict_default,
+)
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.utils import (
     deprecate_inference_params,
@@ -43,6 +47,7 @@ from megatron.core.utils import (
     is_te_min_version,
     nvtx_range_pop,
     nvtx_range_push,
+    make_tp_sharded_tensor_for_checkpoint,
 )
 
 from ..models.common.embeddings.yarn_rotary_pos_embedding import (
@@ -103,6 +108,26 @@ try:
 except ImportError:
     HAVE_FUSED_QKV_ROPE = False
 
+
+class ExtendedEmbedding(torch.nn.Embedding):
+    """
+    torch.nn.Embedding with sharded state dict.
+    """
+
+    def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
+        """Sharding along axis 1 (embedding dim)."""        
+        state_dict = self.state_dict(prefix="", keep_vars=True)
+        weight_prefix = f"{prefix}weight"
+        return {
+            weight_prefix: make_tp_sharded_tensor_for_checkpoint(
+                tensor=state_dict["weight"],
+                key=weight_prefix,
+                tp_axis=1,
+                allow_shape_mismatch=True,
+                prepend_offsets=sharded_offsets,
+            )
+        }
+
 @dataclass
 class SelfDiffAttentionSubmodules:
     """
@@ -127,6 +152,8 @@ class DiffAttention(MegatronModule, ABC):
         config: DragonConfig,
         submodules: SelfDiffAttentionSubmodules,
         layer_number: int,
+        vocab_size: int,
+        use_ve: bool,
         attn_mask_type: AttnMaskType,
         attention_type: str,
         cp_comm_type: str = None,
@@ -170,6 +197,19 @@ class DiffAttention(MegatronModule, ABC):
         # To support both CUDA Graphs and key value with different hidden size
         self.key_hidden_size = self.hidden_size_per_attention_head
         self.val_hidden_size = self.hidden_size_per_attention_head
+
+        # VE embeddings and scalars
+        self.use_ve = use_ve
+        if use_ve:
+            self.ve_embedding = ExtendedEmbedding(
+                num_embeddings=vocab_size,
+                embedding_dim=self.num_noise_heads_per_partition*self.hidden_size_per_attention_head,
+            )
+            with torch.no_grad():
+                self.ve_embedding.weight.normal_(mean=0.0, std=config.init_embedding_std)
+            setattr(self.ve_embedding.weight, 'tensor_model_parallel', True)
+            self.ve_scalars = torch.nn.Parameter(torch.zeros(self.num_noise_heads_per_partition, self.hidden_size_per_attention_head, dtype=torch.float32))
+            setattr(self.ve_scalars, 'tensor_model_parallel', True)
 
         # Scalable softmax scalers
         if not config.intra_doc_masking:
@@ -683,6 +723,7 @@ class DiffAttention(MegatronModule, ABC):
         rotary_pos_cos_sin: Optional[Tensor] = None,
         attention_bias: Optional[Tensor] = None,
         window_size: Optional[Tuple[int, int]] = None,
+        input_ids: Optional[Tensor] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
         sequence_len_offset: Optional[int] = None,
         *,
@@ -789,6 +830,11 @@ class DiffAttention(MegatronModule, ABC):
         B_v = rearrange(B_v, '... (r d) -> ... r d', r=self.config.tpa_rank)
         key = torch.matmul(A_k, B_k).mul_(self.inv_rank)
         value = torch.matmul(A_v, B_v).mul_(self.inv_rank)
+
+        # value embeddings
+        if self.use_ve:
+            ve = self.ve_embedding(input_ids) # (B,S, H_noise_local*D)
+            value = value + self.ve_scalars * ve.view_as(value)
 
         nvtx_range_pop(suffix="qkv")
 
@@ -1075,7 +1121,7 @@ class DiffAttention(MegatronModule, ABC):
 
         return core_attn_out
 
-    @torch.compile # TODO: reactive. it's disabled during tests
+    @torch.compile
     def _torch_compiled_token_shift(self, key, value, alpha_k, alpha_v, position_ids=None):
         alpha_k = torch.sigmoid(alpha_k.float()).float().to(key.dtype) # (L, B, H_local, 1)
         alpha_v = torch.sigmoid(alpha_v.float()).float().to(value.dtype) # (L, B, H_noise_local, 1)
@@ -1098,13 +1144,41 @@ class DiffAttention(MegatronModule, ABC):
 
         return key, value
 
-    @torch.compile # TODO: reactive. it's disabled during tests
+    @torch.compile
     def _torch_compiled_output_gate(self, x, gate):
         x_dtype = x.dtype
         gate = gate.contiguous().view(*x.shape)
         x = x * torch.nn.functional.silu(gate.float() + 1.15)
         x = x.to(x_dtype)
         return x
+
+    def sharded_state_dict(self, prefix='', sharded_offsets=(), metadata=None):
+        """Provide a sharded state dictionary for distributed checkpointing."""
+        sharded_state_dict = {}
+        # Parameters
+        self._save_to_state_dict(sharded_state_dict, '', keep_vars=True)
+        axis_map = {
+            'softmax_scaler': 2 if not self.config.intra_doc_masking else 1,  
+        }
+        if self.use_ve:
+            axis_map.update({
+                've_scalars': 0,
+            })
+
+        sharded_state_dict = make_sharded_tensors_for_checkpoint(
+            sharded_state_dict,
+            prefix,
+            tensor_parallel_layers_axis_map=axis_map, # parameters sharded across TP
+            sharded_offsets=sharded_offsets,
+        )
+        # Submodules
+        for name, module in self.named_children():
+            module_sharded_sd = sharded_state_dict_default(
+                module, f'{prefix}{name}.', sharded_offsets, metadata
+            )
+            sharded_state_dict.update(module_sharded_sd)
+
+        return sharded_state_dict
 
     def set_for_recompute_input_layernorm(self):
         """Set the attention layer for recompute input_layernorm. Only needed for fp8."""
@@ -1122,6 +1196,8 @@ class SelfDiffAttention(DiffAttention):
         config: DragonConfig,
         submodules: SelfDiffAttentionSubmodules,
         layer_number: int,
+        vocab_size: int = 50000,
+        use_ve=False,
         attn_mask_type=AttnMaskType.padding,
         cp_comm_type: str = None,
         pg_collection: ProcessGroupCollection = None,
@@ -1130,6 +1206,8 @@ class SelfDiffAttention(DiffAttention):
             config=config,
             submodules=submodules,
             layer_number=layer_number,
+            vocab_size=vocab_size,
+            use_ve=use_ve,
             attn_mask_type=attn_mask_type,
             attention_type="self",
             cp_comm_type=cp_comm_type,

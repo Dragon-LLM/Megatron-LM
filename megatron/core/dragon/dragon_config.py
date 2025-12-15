@@ -63,6 +63,10 @@ class DragonConfig(ModelParallelConfig):
 
     num_first_mlp: int = 0
 
+    use_value_embeddings: bool = False
+
+    layers_ve_config: str = '0000000'
+
     num_layers_in_first_pipeline_stage: Optional[int] = None
     """Number of Dragon layers on first pipeline stage.
     None implies equal layer division across PP ranks."""
@@ -274,11 +278,11 @@ class DragonConfig(ModelParallelConfig):
     ####################
     # initialization
     ####################
-    init_std: float = 1.0
+    init_std: float = 1.
 
-    init_output_std: Optional[float] = None
+    init_output_std: Optional[float] = 1.
 
-    init_embedding_std: Optional[float] = None
+    init_embedding_std: Optional[float] = 1.
 
     init_model_with_meta_device: bool = False
     """

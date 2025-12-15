@@ -29,7 +29,7 @@ from megatron.training import inprocess_restart
 from megatron.training.arguments import parse_args, validate_args
 from megatron.training.async_utils import init_persistent_async_worker
 from megatron.training.checkpointing import load_args_from_checkpoint
-from megatron.training.global_vars import set_global_variables
+from megatron.training.global_vars import set_global_variables, set_wandb_writer
 from megatron.training.yaml_arguments import validate_yaml
 
 logger = logging.getLogger(__name__)
@@ -167,6 +167,10 @@ def initialize_megatron(
 
         # No continuation function
         return None
+    
+
+def initialize_wandb(args):
+    set_wandb_writer(args)
 
 
 def _compile_dependencies():

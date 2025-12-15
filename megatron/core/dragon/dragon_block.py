@@ -276,6 +276,7 @@ class DragonBlock(GraphableMegatronModule, MegatronModule):
         post_layer_norm: bool = True,
         pre_process: bool = True,
         post_process: bool = True,
+        vocab_size: int = 50000,
         pg_collection: ProcessGroupCollection = None,
         vp_stage: Optional[int] = None,
     ):
@@ -324,17 +325,17 @@ class DragonBlock(GraphableMegatronModule, MegatronModule):
             self.offload_context, self.group_prefetch_offload_commit_async = nullcontext(), None
             self.config._cpu_offloading_context = None
 
-        self._build_layers()
+        self._build_layers(vocab_size)
         self.num_layers_per_pipeline_rank = len(self.layers)
 
-    def _build_layers(self):
+    def _build_layers(self, vocab_size):
         # Dragon layers.
         # @jcasper can we improve how we deal with layer_number?
         # currently it's only used in CoreAttention?
         # if self.apply_query_key_layer_scaling:
         #     coeff = self.layer_number
         #     self.norm_factor *= coeff
-        def build_layer(layer_spec, layer_number, layer_mixer_type, layer_mlp_type):
+        def build_layer(layer_spec, layer_number, layer_mixer_type, layer_mlp_type, vocab_size, use_ve):
             global_layer_number = layer_number + get_dragon_layer_offset(
                 self.config, self.vp_stage, get_pg_rank(self.pg_collection.pp)
             )  # 1-based index
@@ -362,6 +363,8 @@ class DragonBlock(GraphableMegatronModule, MegatronModule):
                     layer_mixer_type=layer_mixer_type,
                     layer_mlp_type=layer_mlp_type,
                     layer_number=layer_number,
+                    vocab_size=vocab_size,
+                    use_ve=use_ve,
                     pg_collection=self.pg_collection,
                     vp_stage=self.vp_stage,
                 )
@@ -375,7 +378,7 @@ class DragonBlock(GraphableMegatronModule, MegatronModule):
             layers_mlp_config = list('d' * self.config.num_layers)
         self.layers = torch.nn.ModuleList(
             [
-                build_layer(layer_spec, i + 1, self.config.layers_mixer_config[i], layers_mlp_config[i])
+                build_layer(layer_spec, i + 1, self.config.layers_mixer_config[i], layers_mlp_config[i], vocab_size, self.config.use_value_embeddings and int(self.config.layers_ve_config[i]))
                 for i, layer_spec in enumerate(self.submodules.layer_specs)
             ]
         )
@@ -593,6 +596,7 @@ class DragonBlock(GraphableMegatronModule, MegatronModule):
         rotary_pos_cos_sin: Optional[Tensor] = None,
         attention_bias: Optional[Tensor] = None,
         window_size: Optional[Tuple[int, int]] = None,
+        input_ids: Optional[Tensor] = None,
         inference_context: Optional[BaseInferenceContext] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
         sequence_len_offset: Optional[Tensor] = None,
@@ -700,6 +704,7 @@ class DragonBlock(GraphableMegatronModule, MegatronModule):
                     rotary_pos_emb=rotary_pos_emb,
                     attention_bias=attention_bias,
                     window_size=window_size,
+                    input_ids=input_ids,
                     packed_seq_params=packed_seq_params,
                     use_inner_quantization_context=use_inner_quantization_context,
                 )
@@ -736,6 +741,7 @@ class DragonBlock(GraphableMegatronModule, MegatronModule):
                             rotary_pos_cos_sin=rotary_pos_cos_sin,
                             attention_bias=attention_bias,
                             window_size=window_size,
+                            input_ids=input_ids if self.config.use_value_embeddings else None,
                             stashed_hs=stashed_hs,
                             inference_context=inference_context,
                             packed_seq_params=packed_seq_params,

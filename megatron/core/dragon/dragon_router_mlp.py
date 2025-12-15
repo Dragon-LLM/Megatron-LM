@@ -334,6 +334,8 @@ class DragonRouterMLP(MegatronModule):
         sharded_state_dict = {}
         singleton_local_shards = (metadata or {}).get('singleton_local_shards', False)
         for name, module in self._modules.items():
+            if name == "eda_norm" or name == "activation_func":
+                continue
             sub_sd = module.sharded_state_dict(f"{prefix}{name}.", sharded_offsets, metadata)
             if self.config.gated_linear_unit and name == "linear_fc1":
                 for k, v in sub_sd.items():

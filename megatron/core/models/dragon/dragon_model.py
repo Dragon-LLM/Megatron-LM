@@ -206,6 +206,7 @@ class DragonModel(LanguageModule):
             spec=dragon_layer_spec,
             pre_process=self.pre_process,
             post_process=self.post_process,
+            vocab_size=self.vocab_size,
             pg_collection=self.pg_collection,
             vp_stage=vp_stage,
         )
@@ -487,6 +488,7 @@ class DragonModel(LanguageModule):
             rotary_pos_sin=rotary_pos_sin,
             rotary_pos_cos_sin=rotary_pos_cos_sin,
             window_size=window_size,
+            input_ids=input_ids,
             packed_seq_params=packed_seq_params,
             sequence_len_offset=sequence_len_offset,
             **(extra_block_kwargs or {}),
@@ -765,14 +767,6 @@ class DragonModel(LanguageModule):
             ShardedStateDict: sharded state dict for the GPTModel
         """
         sharded_state_dict = super().sharded_state_dict(prefix, sharded_offsets, metadata)
-        output_layer_extra_state_key = f'{prefix}output_layer._extra_state'
-
-        # Old GPT checkpoints only stored the output layer weight key. So we remove the
-        # _extra_state key but check that it doesn't contain any data anyway
-        output_extra_state = sharded_state_dict.pop(output_layer_extra_state_key, None)
-        assert not (
-            output_extra_state and output_extra_state.data
-        ), f'Expected output layer extra state to be empty, got: {output_extra_state}'
 
         # Multi-Token Prediction (MTP) need embedding layer in mtp process stage.
         # If MTP is not placed in the pre processing stage, we need to maintain a copy of
