@@ -887,39 +887,26 @@ def track_moe_balance(
 
     layer_ids = sorted(bias_per_layer.keys())
     stacked_tokens_per_expert = torch.stack([tokens_per_layer[i] for i in layer_ids], dim=0)
-    stacked_expert_bias = torch.stack([bias_per_layer[i] for i in layer_ids], dim=0)
+
+    counts = stacked_tokens_per_expert.float()  # (n_layers, n_experts)
+    denom = counts.sum(dim=1, keepdim=True).clamp_min(1.0)
+    p = counts / denom
+    ent = -(p * p.clamp_min(1e-12).log()).sum(dim=1)      # (n_layers,)
+    norm = math.log(counts.size(1)) if counts.size(1) > 1 else 1.0
+    ent_norm = ent / norm     # (n_layers,) in [0,1]
 
     if writer is not None:
-        # load (%) per layer per expert
-        tokens = stacked_tokens_per_expert.float()  # (n_layers, n_experts)
-        denom = tokens.sum(dim=1, keepdim=True).clamp_min(1.0)
-        load_pct = (tokens / denom) * 100.0
-        bias = stacked_expert_bias.float()
-
-        n_layers, n_experts = load_pct.shape
-
-        # TensorBoard: log scalars
         for layer_i, layer_id in enumerate(layer_ids):
-            for expert_j in range(n_experts):
-                writer.add_scalar(
-                    f"moe_load_pct/layer_{layer_id}/expert_{expert_j}",
-                    load_pct[layer_i, expert_j].item(),
-                    iteration,
-                )
-                writer.add_scalar(
-                    f"moe_expert_bias/layer_{layer_id}/expert_{expert_j}",
-                    bias[layer_i, expert_j].item(),
-                    iteration,
-                )
+            writer.add_scalar(f"moe_balance_entropy/layer_{layer_id}",
+                            ent_norm[layer_i].item(),
+                            iteration)
 
-        # W&B: log scalars (batched into one dict)
-        if wandb_writer:
-            wb_log = {}
-            for layer_i, layer_id in enumerate(layer_ids):
-                for expert_j in range(n_experts):
-                    wb_log[f"moe_load_pct/layer_{layer_id}/expert_{expert_j}"] = load_pct[layer_i, expert_j].item()
-                    wb_log[f"moe_expert_bias/layer_{layer_id}/expert_{expert_j}"] = bias[layer_i, expert_j].item()
-            wandb_writer.log(wb_log, iteration)
+    if wandb_writer:
+        wandb_writer.log(
+            {f"moe/layer_{layer_id}_balance_entropy": ent_norm[layer_i].item()
+            for layer_i, layer_id in enumerate(layer_ids)},
+            iteration,
+        )
 
 
 def get_updated_expert_bias(tokens_per_expert, expert_bias, expert_bias_update_rate):

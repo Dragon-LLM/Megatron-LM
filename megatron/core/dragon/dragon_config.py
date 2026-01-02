@@ -479,6 +479,9 @@ class DragonConfig(ModelParallelConfig):
     different orders to the hidden_states, causing minor numerical differences
     in the hidden_states gradient."""
 
+    moe_routed_input_dim: Optional[int] = None
+    """Latent-MoE"""
+
     moe_shared_expert_gate: bool = False
     """Enable gate for shared expert."""
 

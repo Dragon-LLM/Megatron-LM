@@ -1751,6 +1751,7 @@ def _add_dragon_args(parser):
     group.add_argument('--moe-router-type', type=str, default="classic")
     group.add_argument("--no-mixer-gn", dest="mixer_gn", action="store_false")
     group.add_argument('--reset-training', action='store_true')
+    group.add_argument('--moe-routed-input-dim', type=int, default=None)
 
     return parser
 

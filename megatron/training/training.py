@@ -213,6 +213,65 @@ def num_floating_point_operations(args, batch_size):
             + (2 * batch_size * seq_len * d_in * hidden_size)  # out_proj
         )
 
+    def dragon_attention_layer_flops(
+        batch_size, seq_len, hidden_size, num_heads, num_signal_heads, kv_channels, tpa_rank=4,
+    ):
+        """Calculate FLOPs for the forward of an Dragon attention layer."""
+        return (
+            (
+                2
+                * batch_size
+                * seq_len
+                * hidden_size
+                * (num_heads * (kv_channels + tpa_rank) + num_signal_heads * kv_channels + 2 * tpa_rank * kv_channels)
+            )  # in_proj
+            + 2 * batch_size * num_heads * kv_channels * seq_len * seq_len  # core attention
+            + batch_size * seq_len * num_signal_heads * kv_channels  # gate
+            + 2 * batch_size * seq_len * num_signal_heads * kv_channels * hidden_size  # out_proj
+        )
+
+    def gdn_layer_flops(batch_size, seq_len, hidden_size, qk_head_dim, v_head_dim, num_heads, conv_size):
+        """Calculate FLOPs for the forward of a Dragon GDN layer."""
+        qk_dim = qk_head_dim * num_heads
+        v_dim = v_head_dim * num_heads
+        return (
+            (
+                2
+                * batch_size
+                * seq_len
+                * hidden_size
+                * (2 * qk_dim + 2 * v_dim + 2 * num_heads)
+            )  # in_proj
+            + batch_size * seq_len * conv_size * (2 * qk_dim + v_dim)  # conv1d
+            + batch_size * seq_len * num_heads * 4 * v_head_dim * v_head_dim # scan
+            + batch_size * seq_len * v_dim  # gate
+            + 2 * batch_size * seq_len * v_dim * hidden_size  # out_proj
+        )
+
+    def mamba3_mimo_layer_flops(batch_size, seq_len, hidden_size, state_dim=16,
+                                head_dim=64, num_groups=1, num_heads=128, mimo_rank=4, mimo_proj_block_order=1):
+        """Calculate FLOPs for the forward of a Mamba3 MIMO layer."""
+        # Note (rwaleffe): flops estimate for scan should be updated based on new SSD kernels,
+        # but small percent of overall layer flops
+        d_inner = 2 * hidden_size
+        if num_heads:
+            nheads = num_heads
+        else:
+            nheads = d_inner // head_dim
+        return (
+            (
+                2
+                * batch_size
+                * seq_len
+                * hidden_size
+                * (2 * d_inner + 2 * num_groups * mimo_rank * state_dim + 3 * nheads)
+            )  # in_proj
+            + 6 * batch_size * seq_len * d_inner * mimo_rank * mimo_proj_block_order
+            + (7 * batch_size * seq_len * d_inner * state_dim * ((4*mimo_rank+2)/5))  # scan
+            + batch_size * seq_len * mimo_rank * d_inner  # gate
+            + 2 * batch_size * seq_len * nheads * head_dim * hidden_size  # out_proj
+        )
+
     def hybrid_flops(batch_size, seq_len, hidden_size,
                      num_attn_layers, num_mamba_layers, num_mlp_layers,
                      mamba_state_dim=128, mamba_head_dim=64,
@@ -475,8 +534,96 @@ def num_floating_point_operations(args, batch_size):
         )
         return total_floating_point_operations
 
+    def dragon_flops():
+        """Calculate FLOPs for a standard Dragon model."""
+        # MoE.
+        if args.num_experts is None:
+            # Every MLP is dense.
+            num_dense_layers = args.num_layers
+            num_moe_layers = 0
+            num_experts_routed_to = 0
+            last_layer_is_moe = 0
+        else:
+            num_moe_layers = args.num_layers - args.num_first_mlp
+            num_dense_layers = args.num_layers - num_moe_layers
+            num_experts_routed_to = args.moe_router_topk
+            last_layer_is_moe = True
+
+        if args.mtp_num_layers is not None:
+            mtp_num_layers = args.mtp_num_layers
+            num_moe_layers += last_layer_is_moe * mtp_num_layers
+            num_dense_layers += (1 - last_layer_is_moe) * mtp_num_layers
+            num_layers = args.num_layers + mtp_num_layers
+        else:
+            mtp_num_layers = 0
+            num_layers = args.num_layers
+
+        moe_ffn_hidden_size = args.moe_ffn_hidden_size if args.moe_ffn_hidden_size is not None else args.ffn_hidden_size
+        shared_expert_ffn_hidden_size = 0 if args.moe_shared_expert_intermediate_size is None else args.moe_shared_expert_intermediate_size
+
+        # SwiGLU.
+        gated_linear_multiplier = 3 / 2 if args.swiglu else 1
+
+        # The 12x term below comes from the following factors; for more details, see
+        # "APPENDIX: FLOATING-POINT OPERATIONS" in https://arxiv.org/abs/2104.04473.
+        # - 3x: Each GEMM in the model needs to be performed 3 times (forward pass,
+        #       backward wgrad [weight gradient], backward dgrad [data gradient]).
+        # - 2x: GEMMs of a particular size are stacked twice in the standard Transformer model
+        #       architectures implemented in this codebase (e.g., h->ffn_h GEMM and ffn_h->h GEMM
+        #       in MLP layer).
+        # - 2x: A GEMM of a m*n tensor with a n*k tensor requires 2mnk floating-point operations.
+        expansion_factor = 3 * 2 * 2
+
+        mixer_attn_flops = 3 * dragon_attention_layer_flops(batch_size, args.seq_length, args.hidden_size, args.num_attention_heads, args.num_signal_heads, args.kv_channels, args.tpa_rank)
+        mixer_gdn_flops = 3 * gdn_layer_flops(batch_size, args.seq_length, args.hidden_size, args.linear_key_head_dim, args.linear_value_head_dim, args.linear_num_key_heads, args.linear_conv_kernel_dim)
+        mixer_mamba3_flops = 3 * mamba3_mimo_layer_flops(batch_size, args.seq_length, args.hidden_size, args.mamba_state_dim, args.mamba_head_dim, args.mamba_num_groups, args.mamba_num_heads, args.mamba_mimo_dim, args.mamba_mimo_proj_block_order)
+        num_attn_layers = args.layers_mixer_config.count("T")
+        num_gdn_layers = args.layers_mixer_config.count("g")
+        num_mamba3_layers = args.layers_mixer_config.count("3")
+
+        total_floating_point_operations = (
+            # MLP
+            batch_size
+            * args.seq_length
+            * expansion_factor
+            * num_layers
+            * args.hidden_size
+            * (
+                # dense layer (deepseek v2, v3 style)
+                (args.ffn_hidden_size * gated_linear_multiplier)
+                * (num_dense_layers / num_layers)
+                # routed experts
+                + (moe_ffn_hidden_size * num_experts_routed_to * gated_linear_multiplier)
+                * (num_moe_layers / num_layers)
+                # Shared Experts.
+                + (shared_expert_ffn_hidden_size * gated_linear_multiplier)
+                * (num_moe_layers / num_layers)
+            )
+            # mixers
+            + mixer_attn_flops * num_attn_layers
+            + mixer_gdn_flops * num_gdn_layers
+            + mixer_mamba3_flops * num_mamba3_layers
+            # MTP norms and proj
+            + 3
+            * 2
+            * batch_size
+            * args.seq_length
+            * mtp_num_layers
+            * (
+                # MTP eh norm + final nrom
+                3 * args.hidden_size
+                # MTH eh proj
+                + 2 * args.hidden_size * args.hidden_size
+            )
+            # Logit.
+            + batch_size * args.seq_length * 3 * 2 * args.hidden_size * args.padded_vocab_size * (mtp_num_layers + 1)
+        )
+        return total_floating_point_operations
+
     # Main entrypoint for FLOPs calculation.
-    if args.is_hybrid_model:
+    if args.is_dragon_model:
+        return dragon_flops()
+    elif args.is_hybrid_model:
         # Calculate the number of each type of layer.
         num_attn_layers, num_mamba_layers, num_mlp_layers = calculate_layer_counts()
 
@@ -1711,7 +1858,7 @@ def training_log(
             num_first_mlp_layers=args.num_first_mlp,
             mtp_num_layers=args.mtp_num_layers,
         )
-        if iteration % 250 == 0:
+        if iteration % 50 == 0:
             track_moe_balance(
                 model=model,
                 iteration=iteration,

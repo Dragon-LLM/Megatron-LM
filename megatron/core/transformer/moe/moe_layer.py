@@ -24,6 +24,8 @@ from megatron.core.transformer.moe.token_dispatcher import (
 )
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.extensions.transformer_engine import TELinear
+from megatron.core.dragon.dragon_config import DragonConfig
 
 try:
     import transformer_engine as te  # pylint: disable=unused-import
@@ -52,7 +54,7 @@ class BaseMoELayer(MegatronModule, ABC):
 
     def __init__(
         self,
-        config: TransformerConfig,
+        config: Union[TransformerConfig, DragonConfig],
         layer_number: Optional[int] = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
     ):
@@ -104,11 +106,12 @@ class MoELayer(BaseMoELayer):
 
     def __init__(
         self,
-        config: TransformerConfig,
+        config: Union[TransformerConfig, DragonConfig],
         submodules: Optional[MoESubmodules] = None,
         layer_number: Optional[int] = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
     ):
+        self.config = config
         self.submodules = submodules
         # TODO(Hepteract): delete the usage of the global parallel_state.
         # Initialize process groups with the global parallel_state.
@@ -127,6 +130,30 @@ class MoELayer(BaseMoELayer):
 
         # Initialize router
         self.router = TopKRouter(config=self.config, pg_collection=pg_collection)
+
+        if config.moe_routed_input_dim:
+            self.down_proj = TELinear(
+                config.hidden_size,
+                config.moe_routed_input_dim,
+                config=self.config,
+                parallel_mode="duplicated",
+                init_method=self.config.init_method,
+                bias=True,
+                skip_bias_add=True,
+                skip_weight_param_allocation=False,
+                tp_comm_buffer_name="down_proj",
+            )
+            self.up_proj = TELinear(
+                config.moe_routed_input_dim,
+                config.hidden_size,
+                config=self.config,
+                parallel_mode="duplicated",
+                init_method=self.config.init_method,
+                bias=True,
+                skip_bias_add=True,
+                skip_weight_param_allocation=False,
+                tp_comm_buffer_name="up_proj",
+            )
 
         # Initialize token dispatcher
         if config.moe_token_dispatcher_type == "allgather":
@@ -257,7 +284,7 @@ class MoELayer(BaseMoELayer):
 
         return output, mlp_bias
 
-    def combine(self, output: torch.Tensor, shared_expert_output: Optional[torch.Tensor]):
+    def combine(self, output: torch.Tensor):
         """Combines expert outputs via communication and adds shared expert output.
 
         This method uses the token dispatcher to combine the outputs from different
@@ -266,8 +293,6 @@ class MoELayer(BaseMoELayer):
         """
         output = self.token_dispatcher.token_combine(output)
         output = self.token_dispatcher.combine_postprocess(output)
-        if shared_expert_output is not None:
-            output = output + shared_expert_output
         return output
 
     def forward(self, hidden_states: torch.Tensor, stashed_hs=None):
@@ -296,6 +321,8 @@ class MoELayer(BaseMoELayer):
             try:
                 shared_expert_output = self.shared_experts_compute(hidden_states)
                 probs, routing_map, stashed_hs = self.route(hidden_states, stashed_hs)
+                if self.config.moe_routed_input_dim:
+                    hidden_states, _ = self.down_proj(hidden_states)
                 hidden_states, probs, residual = self.preprocess(hidden_states, probs, routing_map)
             except MoECudaGraphPartialCaptureSignal as e:
                 # This signal is raised from the maybe_skip_or_early_return_by_cudagraph decorator.
@@ -307,7 +334,11 @@ class MoELayer(BaseMoELayer):
 
             dispatched_input, probs = self.dispatch(hidden_states, probs)
             output, mlp_bias = self.routed_experts_compute(dispatched_input, probs, residual)
-            output = self.combine(output, shared_expert_output)
+            output = self.combine(output)
+            if self.config.moe_routed_input_dim:
+                output, _ = self.up_proj(output)
+            if shared_expert_output is not None:
+                output = output + shared_expert_output
             return output, mlp_bias, routing_map, stashed_hs
 
         if self.moe_layer_recompute:
