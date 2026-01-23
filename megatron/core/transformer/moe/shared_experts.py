@@ -41,6 +41,7 @@ class SharedExpertMLP(MLP):
         config: TransformerConfig,
         submodules: MLPSubmodules,
         gate: bool,
+        input_scalar: float = 1.,
         pg_collection: Optional[ProcessGroupCollection] = None,
     ):
         config = deepcopy(config)
@@ -49,7 +50,7 @@ class SharedExpertMLP(MLP):
 
         config.ffn_hidden_size = config.moe_shared_expert_intermediate_size
         # TODO(Hepteract): pass pg_collection to MLP after refactoring MLP
-        super().__init__(config=config, submodules=submodules)
+        super().__init__(config=config, submodules=submodules, input_scalar=input_scalar)
 
         self.use_shared_expert_gate = gate
         if self.use_shared_expert_gate:

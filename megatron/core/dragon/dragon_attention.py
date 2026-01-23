@@ -221,7 +221,7 @@ class DiffAttention(MegatronModule, ABC):
         # Diff attention scalers
         self.lambda_init = 0.8 - 0.6 * math.exp(-0.3 * layer_number)
         with get_cuda_rng_tracker().fork():
-        #with nullcontext(): # TEMP
+        #with nullcontext():
             head_dim = self.hidden_size_per_attention_head // 2
             self.lambda_q1 = torch.nn.Parameter(torch.zeros(head_dim, dtype=torch.float32).normal_(mean=0,std=0.1))
             self.lambda_k1 = torch.nn.Parameter(torch.zeros(head_dim, dtype=torch.float32).normal_(mean=0,std=0.1))
@@ -241,7 +241,7 @@ class DiffAttention(MegatronModule, ABC):
             num_attention_heads=self.num_signal_heads,
             num_query_groups=self.num_signal_heads,
             cp_comm_type=cp_comm_type,
-            softmax_scale=None if not self.config.use_uscaling else 1/self.key_hidden_size,
+            softmax_scale=None if not (self.config.use_uscaling or self.config.use_completedp) else 1/self.key_hidden_size,
             softcap=self.softcap,
             pg_collection=self.pg_collection,
         )
@@ -254,7 +254,7 @@ class DiffAttention(MegatronModule, ABC):
             num_attention_heads=self.num_noise_heads,
             num_query_groups=self.num_noise_heads,
             cp_comm_type=cp_comm_type,
-            softmax_scale=None if not self.config.use_uscaling else 1/self.key_hidden_size,
+            softmax_scale=None if not (self.config.use_uscaling or self.config.use_completedp) else 1/self.key_hidden_size,
             softcap=self.softcap,
             pg_collection=self.pg_collection,
         )
@@ -1198,6 +1198,7 @@ class SelfDiffAttention(DiffAttention):
         layer_number: int,
         vocab_size: int = 50000,
         use_ve=False,
+        input_scalar: float = 1.,
         attn_mask_type=AttnMaskType.padding,
         cp_comm_type: str = None,
         pg_collection: ProcessGroupCollection = None,
@@ -1238,6 +1239,8 @@ class SelfDiffAttention(DiffAttention):
             is_expert=False,
             tp_comm_buffer_name='in',
             tp_group=self.pg_collection.tp,
+            alpha_fwd=input_scalar,
+            alpha_bwd=input_scalar,
         )
 
         out_dim = 2 * r * Dk
@@ -1253,6 +1256,8 @@ class SelfDiffAttention(DiffAttention):
             parallel_mode='duplicated',
             is_expert=False,
             tp_comm_buffer_name='BkBv',
+            alpha_fwd=input_scalar,
+            alpha_bwd=input_scalar,
         )
         w = self.linear_BkBv.weight
         b = getattr(self.linear_BkBv, "bias", None)

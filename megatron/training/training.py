@@ -1323,6 +1323,8 @@ def get_optimizer_param_scheduler(optimizer):
         alpha=args.ademamix_alpha,
         beta3_warmup_steps=args.ademamix_beta3_warmup_steps if args.ademamix_beta3_warmup_steps is not None else args.train_iters,
         alpha_warmup_steps=args.ademamix_alpha_warmup_steps if args.ademamix_alpha_warmup_steps is not None else args.train_iters,
+        use_completedp=args.use_completedp,
+        rhosq_adjusted=args.train_iters_base / args.train_iters,
         use_checkpoint_opt_param_scheduler=args.use_checkpoint_opt_param_scheduler,
         override_opt_param_scheduler=args.override_opt_param_scheduler,
         wsd_decay_steps=wsd_decay_steps,
@@ -1372,6 +1374,11 @@ def setup_model_and_optimizer(
             config,
             model,
             args.use_uscaling,
+            args.use_completedp,
+            args.completedp_alpha,
+            math.sqrt(args.train_iters_base / args.train_iters),
+            args.hidden_size / args.hidden_size_base,
+            len(args.layers_mixer_config) / len(args.layers_mixer_config_base),
             no_wd_decay_cond,
             scale_lr_cond,
             lr_mult,
@@ -1501,6 +1508,30 @@ def setup_model_and_optimizer(
         print_rank_0("> converted checkpoint: %s -> %s." % (load_ckpt_format, args.ckpt_format))
         torch.distributed.barrier()
         exit()
+    
+    @torch.no_grad()
+    def print_named_param_init_stats(model, *, max_name=80, only_trainable=True):
+        header = f"{'name':{max_name}}  {'shape':>16}  {'dtype':>10}  {'device':>10}  {'mean':>12}  {'std':>12}"
+        print_rank_0(header)
+        print_rank_0("-" * len(header))
+
+        for name, p in model[0].named_parameters():
+            if only_trainable and not p.requires_grad:
+                continue
+            x = p.detach()
+            mean = x.float().mean().item()
+            std  = x.float().std(unbiased=False).item()
+
+            nm = name if len(name) <= max_name else ("…" + name[-(max_name - 1):])
+            shp = str(tuple(p.shape))
+            if not "mlp.experts.linear" in name:
+                print_rank_0(
+                    f"{nm:{max_name}}  {shp:>16}  {str(p.dtype):>10}  {str(p.device):>10}  {mean:12.5e}  {std:12.5e}"
+                )
+
+    print_rank_0("=== Model init stats (named params) ===")
+    print_named_param_init_stats(model)
+    print_rank_0("")
 
     return model, optimizer, opt_param_scheduler
 

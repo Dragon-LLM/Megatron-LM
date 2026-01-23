@@ -2,9 +2,10 @@
 
 import logging
 from typing import List, Optional
+from pathlib import Path
 
 try:
-    from transformers import AutoTokenizer
+    from transformers import AutoTokenizer, PreTrainedTokenizerFast
 
     HAVE_TRANSFORMERS = True
 except ModuleNotFoundError:
@@ -65,12 +66,15 @@ class HuggingFaceTokenizer(MegatronTokenizerTextAbstract):
         try:
             # this logic deals with different huggingface tokenizers having different args
             if vocab_file is None:
-                self.tokenizer = AutoTokenizer.from_pretrained(
-                    pretrained_model_name_or_path=tokenizer_path,
-                    use_fast=use_fast,
-                    trust_remote_code=trust_remote_code,
-                    chat_template=chat_template,
-                )
+                if "json" in tokenizer_path:
+                    self.tokenizer = PreTrainedTokenizerFast.from_pretrained(Path(tokenizer_path).parent)
+                else:
+                    self.tokenizer = AutoTokenizer.from_pretrained(
+                        pretrained_model_name_or_path=tokenizer_path,
+                        use_fast=use_fast,
+                        trust_remote_code=trust_remote_code,
+                        chat_template=chat_template,
+                    )
             elif merges_file is None:
                 self.tokenizer = AutoTokenizer.from_pretrained(
                     pretrained_model_name_or_path=tokenizer_path,

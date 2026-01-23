@@ -32,6 +32,15 @@ class OptimizerConfig:
     lr_mult_head: Optional[float] = None
     """Learning rate multiplier for output head layers. uscaling only"""
 
+    lr_emb: Optional[float] = None
+    """Initial learning rate for embedding layers. completed only"""
+
+    lr_scalar: Optional[float] = None
+    """Initial learning rate for scalar parameters (e.g., layernorm and bias). completed only"""
+
+    lr_head: Optional[float] = None
+    """Initial learning rate for output head layers. completed only"""
+
     min_lr: Optional[float] = None
     """Minumum value for learning rate. The scheduler clip values below this threshold."""
 

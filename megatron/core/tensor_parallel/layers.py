@@ -7,6 +7,7 @@ import os
 import warnings
 from functools import partial
 from typing import Any, Callable, List, Optional, Tuple
+from contextlib import nullcontext
 
 import torch
 import torch.nn.functional as F
@@ -136,6 +137,7 @@ def _initialize_affine_weight_gpu(weight, init_method, partition_dim, stride=1, 
 
     if not is_expert:
         with get_cuda_rng_tracker().fork():
+        #with nullcontext():
             init_method(weight)
     else:
         with get_cuda_rng_tracker().fork(get_expert_parallel_rng_tracker_name()):

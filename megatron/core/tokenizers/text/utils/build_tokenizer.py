@@ -33,7 +33,7 @@ def build_tokenizer(args):
             kwargs['vocab_size'] = args.vocab_size
         kwargs['num_special_tokens'] = args.tiktoken_num_special_tokens
         kwargs['special_tokens'] = args.tiktoken_special_tokens
-    elif args.tokenizer_type == 'HuggingFaceTokenizer':
+    elif args.tokenizer_type == 'HuggingFaceTokenizer' or args.tokenizer_type == 'HuggingFacePretrainedTokenizer':
         tokenizer_library = 'huggingface'
         tokenizer_path = args.tokenizer_model
         kwargs['vocab_file'] = args.vocab_file

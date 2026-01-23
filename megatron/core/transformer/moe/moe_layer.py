@@ -109,6 +109,7 @@ class MoELayer(BaseMoELayer):
         config: Union[TransformerConfig, DragonConfig],
         submodules: Optional[MoESubmodules] = None,
         layer_number: Optional[int] = None,
+        input_scalar: float = 1.,
         pg_collection: Optional[ProcessGroupCollection] = None,
     ):
         self.config = config
@@ -129,7 +130,7 @@ class MoELayer(BaseMoELayer):
         )
 
         # Initialize router
-        self.router = TopKRouter(config=self.config, pg_collection=pg_collection)
+        self.router = TopKRouter(config=self.config, input_scalar=input_scalar, pg_collection=pg_collection)
 
         if config.moe_routed_input_dim:
             self.down_proj = TELinear(
@@ -138,7 +139,9 @@ class MoELayer(BaseMoELayer):
                 config=self.config,
                 parallel_mode="duplicated",
                 init_method=self.config.init_method,
-                bias=True,
+                bias=False,
+                alpha_fwd=input_scalar,
+                alpha_bwd=input_scalar,
                 skip_bias_add=True,
                 skip_weight_param_allocation=False,
                 tp_comm_buffer_name="down_proj",
@@ -149,7 +152,7 @@ class MoELayer(BaseMoELayer):
                 config=self.config,
                 parallel_mode="duplicated",
                 init_method=self.config.init_method,
-                bias=True,
+                bias=False,
                 skip_bias_add=True,
                 skip_weight_param_allocation=False,
                 tp_comm_buffer_name="up_proj",
@@ -197,6 +200,7 @@ class MoELayer(BaseMoELayer):
                 config=self.config,
                 pg_collection=pg_collection,
                 gate=self.config.moe_shared_expert_gate,
+                input_scalar=input_scalar,
             )
             if self.shared_expert_overlap:
                 self.token_dispatcher.set_shared_experts(self.shared_experts)

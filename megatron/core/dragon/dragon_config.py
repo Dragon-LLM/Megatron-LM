@@ -47,11 +47,18 @@ class DragonConfig(ModelParallelConfig):
 
     uscaling_tau: float = 0.2
 
+    use_completedp: bool = False
+
+    completedp_alpha: float = 0.5
+
+    layers_mixer_config_base: int = 0
+
+    hidden_size_base: int = 0
+
+    use_lns: bool = False
+
     num_layers: int = 0
     """Number of Dragon layers in a Dragon block."""
-
-    #num_attention_layers: int = 0
-    #"""Number of Dragon attentions layers in a Dragon block."""
 
     mtp_num_layers: Optional[int] = None
     """Number of Multi-Token Prediction (MTP) Layers."""
@@ -278,11 +285,11 @@ class DragonConfig(ModelParallelConfig):
     ####################
     # initialization
     ####################
-    init_std: float = 1.
+    init_method_std: float = 1.
 
-    init_output_std: Optional[float] = 1.
+    init_method_output_std: Optional[float] = 1.
 
-    init_embedding_std: Optional[float] = 1.
+    init_method_embedding_std: Optional[float] = 1.
 
     init_model_with_meta_device: bool = False
     """
@@ -1448,9 +1455,13 @@ class DragonConfig(ModelParallelConfig):
         if self.multi_latent_attention and self.rotary_interleaved:
             raise ValueError("rotary_interleaved does not work with multi_latent_attention.")
 
-        self.embedding_init_method = init_method_normal(self.init_embedding_std if self.init_embedding_std else self.init_std)
-        self.init_method = init_method_normal(self.init_std)
-        self.output_layer_init_method = init_method_normal(self.init_output_std if self.init_output_std else self.init_std)
+        if self.use_completedp:
+            self.init_method_std = self.init_method_std * ((self.hidden_size/self.hidden_size_base) ** -0.5)
+            self.init_method_output_std = self.init_method_output_std * ((self.hidden_size/self.hidden_size_base) ** -0.5)
+
+        self.embedding_init_method = init_method_normal(self.init_method_embedding_std if self.init_method_embedding_std else self.init_method_std)
+        self.init_method = init_method_normal(self.init_method_std)
+        self.output_layer_init_method = init_method_normal(self.init_method_output_std if self.init_method_output_std else self.init_method_std)
 
         if self.num_moe_experts is not None and self.add_bias_linear:
             assert (

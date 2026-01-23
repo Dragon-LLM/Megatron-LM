@@ -196,16 +196,18 @@ class _HuggingFacePretrainedTokenizer(MegatronLegacyTokenizer):
     def __init__(self, pretrained_model_name_path: str, **kwargs):
         super().__init__(pretrained_model_name_path, **kwargs)
         try:
-            import tokenizers
+            import transformers
         except ImportError:
-            raise EnvironmentError(f"The tokenizers library must be installed to use huggingface_tokenizer_provider")
-        self._tokenizer = tokenizers.Tokenizer.from_file(pretrained_model_name_path)
+            raise EnvironmentError(
+                f"The transformers library must be installed to use huggingface_tokenizer_provider"
+            )
+        self._tokenizer = transformers.PreTrainedTokenizerFast.from_pretrained(Path(pretrained_model_name_path).parent)
         self._vocab = self._tokenizer.get_vocab()
         self._inv_vocab = {token_id: token for token, token_id in self._vocab.items()}
         
     @property
     def vocab_size(self):
-        return self._tokenizer.get_vocab_size()
+        return self._tokenizer.vocab_size
     
     @property
     def vocab(self):

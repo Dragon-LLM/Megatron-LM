@@ -405,6 +405,9 @@ def validate_args(args, defaults={}):
     if args.attention_backend == AttnBackend.local:
         assert args.spec[0] == 'local' , '--attention-backend local is only supported with --spec local'
 
+    # seq length
+    assert args.seq_length == args.training_sequence_length == args.max_position_embeddings
+
     # Pipeline model parallel size.
     args.transformer_pipeline_model_parallel_size = args.pipeline_model_parallel_size
 
@@ -1726,11 +1729,6 @@ def _add_network_size_args(parser):
 def _add_dragon_args(parser):
     group = parser.add_argument_group(title='dragon')
     group.add_argument('--is-dragon-model', action='store_true')
-    group.add_argument('--use-uscaling', action='store_true')
-    group.add_argument('--uscaling-tau', type=float, default=0.2)
-    group.add_argument('--lr-mult-emb', type=float, default=0.1)
-    group.add_argument('--lr-mult-scalar', type=float, default=0.1)
-    group.add_argument('--lr-mult-head', type=float, default=0.1)
     group.add_argument('--layers-mixer-config', type=str, default='gggTggg')
     group.add_argument('--num-first-mlp', type=int, default=0)
     group.add_argument('--use-value-embeddings', action='store_true')
@@ -1742,7 +1740,7 @@ def _add_dragon_args(parser):
     group.add_argument('--gate-gdn', action='store_true')
     group.add_argument('--softcap-attn', type=float, default=0.)
     group.add_argument('--scalable-softmax', action='store_true')
-    # p-state-passing, not implemented yet
+    # (todo, p-state-passing, not implemented yet)
     group.add_argument('--intra-doc-masking', action='store_true')
     group.add_argument('--training-sequence-length', type=int, default=2048)
     group.add_argument('--slw-warmup-steps', type=int, default=0)
@@ -1752,6 +1750,24 @@ def _add_dragon_args(parser):
     group.add_argument("--no-mixer-gn", dest="mixer_gn", action="store_false")
     group.add_argument('--reset-training', action='store_true')
     group.add_argument('--moe-routed-input-dim', type=int, default=None)
+    group.add_argument('--use-lns', action='store_true')
+    # uscaling
+    group.add_argument('--use-uscaling', action='store_true')
+    group.add_argument('--uscaling-tau', type=float, default=0.2)
+    group.add_argument('--lr-mult-emb', type=float, default=0.1)
+    group.add_argument('--lr-mult-scalar', type=float, default=0.1)
+    group.add_argument('--lr-mult-head', type=float, default=0.1)
+    # completedp
+    group.add_argument('--use-completedp', action='store_true')
+    group.add_argument('--completedp-alpha', type=float, default=0.5)
+    group.add_argument('--init-method-output-std', type=float, default=None)
+    group.add_argument('--init-method-embedding-std', type=float, default=None)
+    group.add_argument('--lr-emb', type=float, default=0.01)
+    group.add_argument('--lr-scalar', type=float, default=0.01)
+    group.add_argument('--lr-head', type=float, default=0.01)
+    group.add_argument('--train-iters-base', type=int, default=None)
+    group.add_argument('--hidden-size-base', type=int, default=None)
+    group.add_argument('--layers-mixer-config-base', type=str, default=None)
 
     return parser
 

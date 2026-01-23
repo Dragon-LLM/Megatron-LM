@@ -73,6 +73,8 @@ class OptimizerParamScheduler:
         alpha: Optional[float] = None,
         beta3_warmup_steps: Optional[int] = None,
         alpha_warmup_steps: Optional[int] = None,
+        use_completedp: Optional[bool] = False,
+        rhosq_adjusted: Optional[float] = 1.0,
         use_checkpoint_opt_param_scheduler: Optional[bool] = True,
         override_opt_param_scheduler: Optional[bool] = False,
         wsd_decay_steps: Optional[int] = None,
@@ -121,6 +123,9 @@ class OptimizerParamScheduler:
         self.alpha = alpha
         self.beta3_warmup_steps = beta3_warmup_steps
         self.alpha_warmup_steps = alpha_warmup_steps
+
+        self.use_completedp = use_completedp
+        self.rhosq_adjusted = rhosq_adjusted
 
         self.override_opt_param_scheduler = override_opt_param_scheduler
         self.use_checkpoint_opt_param_scheduler = use_checkpoint_opt_param_scheduler
@@ -259,6 +264,21 @@ class OptimizerParamScheduler:
             if self.ademamix:
                 param_group['alpha'] = self.get_alpha()
                 param_group['betas'] = (self.beta1, self.beta2, self.get_beta3())
+            else:
+                param_group['betas'] = (self.beta1, self.beta2)
+            if self.use_completedp:
+                if self.ademamix:
+                    param_group['betas'] = (
+                        1 - (1 - self.beta1) * self.rhosq_adjusted,
+                        1 - (1 - self.beta2) * self.rhosq_adjusted,
+                        1 - (1 - self.get_beta3()) * self.rhosq_adjusted
+                    )
+                else:
+                    param_group['betas'] = (
+                        1 - (1 - self.beta1) * self.rhosq_adjusted,
+                        1 - (1 - self.beta2) * self.rhosq_adjusted
+                    )
+                param_group['eps'] = param_group['eps']
 
     def state_dict(self) -> dict:
         """Return the state dict."""

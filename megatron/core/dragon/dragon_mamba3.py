@@ -101,6 +101,7 @@ class Mamba3(MegatronModule):
         layer_number: int,
         vocab_size: int = 50000,
         use_ve: bool = False,
+        input_scalar: float = 1.,
         pg_collection: ProcessGroupCollection = None,
     ):
         if not HAVE_MAMBA_SSM:
@@ -193,10 +194,13 @@ class Mamba3(MegatronModule):
             init_method=self.config.init_method,
             gather_output=False,
             bias=False,
+            return_layernorm_output=True,
             skip_bias_add=False,
             is_expert=False,
             tp_comm_buffer_name="in_proj",
             tp_group=self.pg_collection.tp,
+            alpha_fwd=input_scalar,
+            alpha_bwd=input_scalar,
         )
         # WARNING: A_proj was specified as "float32". here, we merge it with in_proj so it's no longer float32.
 
@@ -225,6 +229,8 @@ class Mamba3(MegatronModule):
             parallel_mode='duplicated',
             is_expert=False,
             tp_comm_buffer_name='rope_proj',
+            alpha_fwd=input_scalar,
+            alpha_bwd=input_scalar,
         )
         w = self.rope_proj.weight
         b = getattr(self.rope_proj, "bias", None)
@@ -270,6 +276,7 @@ class Mamba3(MegatronModule):
         setattr(self.out_proj_mimo, "tensor_model_parallel", True)
 
         with get_cuda_rng_tracker().fork():
+        #with nullcontext():
             dt_min = 0.001
             dt_max = 0.1
             dt_init_floor = 1e-4
@@ -338,7 +345,8 @@ class Mamba3(MegatronModule):
         assert not in_inference_mode
 
         # Input projection
-        zxBCdtAtrap, _ = self.in_proj(hidden_states)
+        out, _ = self.in_proj(hidden_states)
+        zxBCdtAtrap, normed_hidden_states = out
         zxBCdtAtrap = zxBCdtAtrap.transpose(0, 1) # s b x --> b s x
         zxBCdtAtrap = rearrange(zxBCdtAtrap, "b l (G D) -> b l G D", G=self.ngroups_local_tp)#.contiguous()
         # split per group: [B, L, G_local, D_group]
@@ -394,7 +402,7 @@ class Mamba3(MegatronModule):
             B = B.repeat(1, 1, 1, n_repeat, 1) # (B, L, R, N, S)
             C = C.repeat(1, 1, 1, n_repeat, 1) # (B, L, R, N, S)
 
-        angle, _ = self.rope_proj(hidden_states) # (L, B, S)
+        angle, _ = self.rope_proj(normed_hidden_states) # (L, B, S)
         if self.config.sequence_parallel:
             angle = gather_from_sequence_parallel_region(angle, group=self.pg_collection.tp)
         angle = angle.transpose(0, 1) # (B, L, S)
@@ -437,7 +445,7 @@ class Mamba3(MegatronModule):
         # Perform MIMO down projection (mimo_rank*d_inner -> d_inner)
         y = rearrange(y, "b l r d -> b l (r d)")
         y = rearrange(y, "b l (g d) -> b l g d", g=self.mimo_dim*self.mimo_proj_block_order)
-        y = torch.einsum("blgd,drg->bldr", y, self.out_proj_mimo)
+        y = torch.einsum("blgd,drg->bldr", y, self.out_proj_mimo.to(y.dtype))
         y = rearrange(y, "b l d r -> b l (d r)")
         y = rearrange(y, "b l (h d) -> b l h d", d=self.headdim)
 

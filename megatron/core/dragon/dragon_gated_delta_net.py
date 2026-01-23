@@ -95,6 +95,7 @@ class GatedDeltaNet(MegatronModule):
         layer_number: int = None,
         vocab_size: int = 50000,
         use_ve: bool = False,
+        input_scalar: float = 1.,
         bias: bool = False,
         conv_bias: bool = False,
         conv_init: Optional[float] = None,
@@ -167,6 +168,8 @@ class GatedDeltaNet(MegatronModule):
             is_expert=False,
             tp_comm_buffer_name="fc1",
             tp_group=self.pg_collection.tp,
+            alpha_fwd=input_scalar,
+            alpha_bwd=input_scalar,
         )
 
         # VE embeddings and scalars
@@ -227,7 +230,7 @@ class GatedDeltaNet(MegatronModule):
         """Reset the parameters."""
         if self.config.perform_initialization:
             with get_cuda_rng_tracker().fork():
-            #with nullcontext(): # TEMP
+            #with nullcontext():
                 # conv1d.weight
                 if self.conv_init is not None:
                     nn.init.uniform_(self.conv1d.weight, -self.conv_init, self.conv_init)
@@ -253,7 +256,7 @@ class GatedDeltaNet(MegatronModule):
                 with torch.no_grad():
                     self.A_log.data.copy_(torch.log(A))
                 with torch.no_grad():
-                    self.conv1d.weight.normal_(0, self.config.init_std)
+                    self.conv1d.weight.normal_(0, self.config.init_method_std)
 
     def forward(
         self,
@@ -377,12 +380,12 @@ class GatedDeltaNet(MegatronModule):
 
         nvtx_range_push(suffix="gated_delta_rule")
         core_attn_out, last_recurrent_state = chunk_gated_delta_rule(
-            query,
-            key,
-            value,
+            query.bfloat16(),
+            key.bfloat16(),
+            value.bfloat16(),
             g=g,
             beta=beta,
-            scale=None if not self.config.use_uscaling else 1/self.key_head_dim,
+            scale=None if not (self.config.use_uscaling or self.config.use_completedp) else 1/self.key_head_dim,
             initial_state=None,
             output_final_state=False,
             use_qk_l2norm_in_kernel=self.use_qk_l2norm,

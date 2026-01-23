@@ -80,6 +80,7 @@ class MLP(MegatronModule):
         is_expert: bool = False,
         input_size: Optional[int] = None,
         ffn_hidden_size: int = None,
+        input_scalar: float = 1.,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
     ):
         super().__init__(config=config)
@@ -113,6 +114,8 @@ class MLP(MegatronModule):
             init_method=self.config.init_method,
             gather_output=False,
             bias=self.config.add_bias_linear,
+            alpha_fwd=input_scalar,
+            alpha_bwd=input_scalar,
             skip_bias_add=True,
             is_expert=is_expert,
             tp_comm_buffer_name="fc1",

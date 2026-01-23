@@ -271,7 +271,11 @@ class DragonLayer(GraphableMegatronModule, BaseDragonLayer):
             self.config, vp_stage, get_pg_rank(pg_collection.pp)
         )
 
-        # [Module 2: Mixer]
+        lns = 1.
+        if self.config.use_lns:
+            lns = self.layer_number ** (-0.5)
+
+        # [Module 1: Mixer]
         if layer_mixer_type == 'T':
             attention_optional_kwargs = {}
             if config.context_parallel_size > 1 and config.cp_comm_type is not None:
@@ -288,6 +292,7 @@ class DragonLayer(GraphableMegatronModule, BaseDragonLayer):
                 layer_number=self.layer_number,
                 vocab_size=vocab_size,
                 use_ve=use_ve,
+                input_scalar=lns,
                 **attention_optional_kwargs,
             )
             num_mixer_heads = self.mixer.num_signal_heads
@@ -300,18 +305,20 @@ class DragonLayer(GraphableMegatronModule, BaseDragonLayer):
                 layer_number=self.layer_number,
                 vocab_size=vocab_size,
                 use_ve=use_ve,
+                input_scalar=lns,
                 pg_collection=pg_collection,
             )
             num_mixer_heads = self.mixer.num_heads
             num_mixer_heads_local = self.mixer.num_heads_local
             head_dim = self.mixer.value_head_dim
-        elif layer_mixer_type == '3':
+        elif layer_mixer_type == 'M':
             self.mixer = build_module(
                 submodules.mamba3,
                 config=self.config,
                 layer_number=self.layer_number,
                 vocab_size=vocab_size,
                 use_ve=use_ve,
+                input_scalar=lns,
                 pg_collection=pg_collection,
             )
             num_mixer_heads = self.mixer.nheads
@@ -320,7 +327,7 @@ class DragonLayer(GraphableMegatronModule, BaseDragonLayer):
         else:
             raise ValueError(f"Unsupported layer mixer type: {layer_mixer_type}")
 
-        # [Module 3: Mixer norm]
+        # [Module 2: Mixer norm]
         self.mixer_norm = build_module(
             submodules.mixer_norm,
             config=self.config,
@@ -330,11 +337,11 @@ class DragonLayer(GraphableMegatronModule, BaseDragonLayer):
         )
         if config.mixer_gn:
             if not config.layernorm_zero_centered_gamma:
-                self.mixer_norm_scalers = torch.nn.Parameter(torch.ones(1, 1, num_mixer_heads_local, head_dim)) # todo: save dict!!
+                self.mixer_norm_scalers = torch.nn.Parameter(torch.ones(1, 1, num_mixer_heads_local, head_dim))
             else:
-                self.mixer_norm_scalers = torch.nn.Parameter(torch.zeros(1, 1, num_mixer_heads_local, head_dim)) # todo: save dict!!
+                self.mixer_norm_scalers = torch.nn.Parameter(torch.zeros(1, 1, num_mixer_heads_local, head_dim))
 
-        # [Module 4: Mixer projection]
+        # [Module 3: Mixer projection]
         self.mixer_proj = build_module(
             submodules.mixer_proj,
             num_mixer_heads*head_dim,
@@ -361,12 +368,14 @@ class DragonLayer(GraphableMegatronModule, BaseDragonLayer):
             self.mlp = build_module(
                 submodules.mlp,
                 config=self.config,
+                input_scalar=lns,
                 tp_group=self.pg_collection.tp
             )
         elif layer_mlp_type == 'm':
             self.mlp = build_module(
                 submodules.moe,
                 config=self.config,
+                input_scalar=lns,
                 pg_collection=pg_collection,
             )
 
@@ -385,8 +394,14 @@ class DragonLayer(GraphableMegatronModule, BaseDragonLayer):
             and "mixer_proj" in self.config.offload_modules
         )
 
-        self.register_buffer("sqrt_tau", torch.sqrt(torch.tensor(config.uscaling_tau)) if config.use_uscaling else torch.tensor(1.0), persistent=False)
-        self.register_buffer("sqrt_one_minus_tau", torch.sqrt(torch.tensor(1.0 - config.uscaling_tau)) if config.use_uscaling else torch.tensor(1.0), persistent=False)
+        a, b = 1., 1.
+        if self.config.use_uscaling:
+            a = self.config.uscaling_tau ** (0.5)
+            b = (1. - self.config.uscaling_tau) ** (0.5)
+        elif self.config.use_completedp:
+            a = (len(self.config.layers_mixer_config)/len(self.config.layers_mixer_config_base)) ** (-self.config.completedp_alpha)
+        self.register_buffer("a", torch.tensor(a), persistent=False)
+        self.register_buffer("b", torch.tensor(b), persistent=False)
 
         # @jcasper how should we handle nvfuser?
         # Set bias+dropout+add fusion grad_enable execution handler.
@@ -435,11 +450,7 @@ class DragonLayer(GraphableMegatronModule, BaseDragonLayer):
                 y_mixer, None, name="mixer_proj", forced_released_tensors=[y_mixer]
             )
         nvtx_range_pop(suffix="mixer_proj")
-
-        # tp=1: 600, tp=4: 340 when returning residual+y_mixer
-        # while after mixer_proj, tp=1,tp=4: 190 for both
-
-        residual = self._torch_compiled_residual_write(residual, y_mixer, self.sqrt_one_minus_tau, self.sqrt_tau)
+        residual = self._torch_compiled_residual_write(residual, y_mixer, self.b, self.a)
 
         hidden_states = self.pre_mlp_norm(residual)
         out = self._forward_mlp(hidden_states, stashed_hs, kwargs.get("inference_context", None))
@@ -449,7 +460,7 @@ class DragonLayer(GraphableMegatronModule, BaseDragonLayer):
             stashed_hs = out[3]
         else:
             y_mlp = out[0]
-        residual = self._torch_compiled_residual_write(residual, y_mlp, self.sqrt_one_minus_tau, self.sqrt_tau)
+        residual = self._torch_compiled_residual_write(residual, y_mlp, self.b, self.a)
         return residual, stashed_hs
 
     def _forward_mixer(

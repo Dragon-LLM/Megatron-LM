@@ -31,7 +31,7 @@ class Router(ABC, MegatronModule):
     """Base Router class"""
 
     def __init__(
-        self, config: TransformerConfig, pg_collection: Optional[ProcessGroupCollection] = None
+        self, config: TransformerConfig, input_scalar: float = 1., pg_collection: Optional[ProcessGroupCollection] = None
     ) -> None:
         """
         Initialize the Router module.
@@ -49,6 +49,7 @@ class Router(ABC, MegatronModule):
         self.cp_group = pg_collection.cp
         self.tp_cp_group = pg_collection.tp_cp
         self.tp_dp_cp_group = pg_collection.tp_dp_cp
+        self.input_scalar = input_scalar
 
         if not hasattr(self.config, 'moe_router_type') or self.config.moe_router_type == 'classic':
             # Initialize the gate weights.
@@ -76,6 +77,7 @@ class Router(ABC, MegatronModule):
             for param in self.dragon_router.parameters():
                 setattr(param, 'sequence_parallel', self.config.sequence_parallel)
             return
+        assert self.config.perform_initialization
         if self.config.perform_initialization:
             self.config.init_method(self.weight)
             if self.bias is not None:
@@ -109,7 +111,7 @@ class Router(ABC, MegatronModule):
             router_dtype = torch.float32
         elif self.config.moe_router_dtype == 'fp64':
             router_dtype = torch.float64
-        logits = router_gating_linear(input, self.weight, self.bias, 1/math.sqrt(self.weight.shape[1]), router_dtype)
+        logits = router_gating_linear(input, self.weight, self.bias, self.input_scalar/math.sqrt(self.weight.shape[1]) if self.config.use_uscaling else self.input_scalar, router_dtype)
         return logits, None
 
     def dragon_gating(self, input: torch.Tensor, stashed_hs=None):
@@ -161,7 +163,7 @@ class TopKRouter(Router):
     """
 
     def __init__(
-        self, config: TransformerConfig, pg_collection: Optional[ProcessGroupCollection] = None
+        self, config: TransformerConfig, input_scalar: float, pg_collection: Optional[ProcessGroupCollection] = None
     ) -> None:
         """Initialize the zero token dropping router.
 
@@ -169,7 +171,7 @@ class TopKRouter(Router):
             config (TransformerConfig): The configuration for the transformer model.
             pg_collection (ProcessGroupCollection, optional): Process groups for MoE operations.
         """
-        super().__init__(config=config, pg_collection=pg_collection)
+        super().__init__(config=config, input_scalar=input_scalar,pg_collection=pg_collection)
         self.topk = self.config.moe_router_topk
         self.routing_type = self.config.moe_router_load_balancing_type
         self.score_function = self.config.moe_router_score_function
