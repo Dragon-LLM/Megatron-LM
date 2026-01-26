@@ -214,6 +214,7 @@ class DragonLayerSubmodules:
     """
 
     attention: Union[ModuleSpec, type] = IdentityOp
+    attention_v2: Union[ModuleSpec, type] = IdentityOp
     gdn: Union[ModuleSpec, type] = IdentityOp
     mamba3: Union[ModuleSpec, type] = IdentityOp
     mixer_norm: Union[ModuleSpec, type] = IdentityFuncOp
@@ -276,7 +277,7 @@ class DragonLayer(GraphableMegatronModule, BaseDragonLayer):
             lns = self.layer_number ** (-0.5)
 
         # [Module 1: Mixer]
-        if layer_mixer_type == 'T':
+        if layer_mixer_type == 'T' or layer_mixer_type == 'V':
             attention_optional_kwargs = {}
             if config.context_parallel_size > 1 and config.cp_comm_type is not None:
                 if isinstance(config.cp_comm_type, list):
@@ -287,7 +288,7 @@ class DragonLayer(GraphableMegatronModule, BaseDragonLayer):
             attention_optional_kwargs["pg_collection"] = pg_collection
 
             self.mixer = build_module(
-                submodules.attention,
+                submodules.attention if layer_mixer_type == 'T' else submodules.attention_v2,
                 config=self.config,
                 layer_number=self.layer_number,
                 vocab_size=vocab_size,

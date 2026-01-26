@@ -29,6 +29,7 @@ from megatron.core.dragon.dragon_block import (
     get_num_layers_to_build,
 )
 from megatron.core.dragon.dragon_attention import SelfDiffAttention, SelfDiffAttentionSubmodules
+from megatron.core.dragon.dragon_attention_v2 import SelfDiffAttentionV2, SelfDiffAttentionV2Submodules
 from megatron.core.dragon.dragon_gated_delta_net import GatedDeltaNet, GatedDeltaNetSubmodules
 from megatron.core.dragon.dragon_mamba3 import Mamba3, Mamba3Submodules
 from megatron.core.transformer.mlp import MLP, MLPSubmodules
@@ -95,6 +96,17 @@ def get_dragon_block_spec(
             k_layernorm=TENorm,
         )
     )
+    attention_v2 = ModuleSpec(
+        module=SelfDiffAttentionV2,
+        params={"attn_mask_type": AttnMaskType.causal if not config.intra_doc_masking else AttnMaskType.padding_causal},
+        submodules=SelfDiffAttentionV2Submodules(
+            linear_in=TELayerNormColumnParallelLinear,
+            linear_BkBv=TELinear,
+            core_attention=TEDotProductAttention,
+            q_layernorm=TENorm,
+            k_layernorm=TENorm,
+        )
+    )
     gdn = ModuleSpec(
         module=GatedDeltaNet,
         submodules=GatedDeltaNetSubmodules(
@@ -148,6 +160,7 @@ def get_dragon_block_spec(
         params={},
         submodules=DragonLayerSubmodules(
             attention=attention,
+            attention_v2=attention_v2,
             gdn=gdn,
             mamba3=mamba3,
             mixer_norm=TENorm,
