@@ -29,7 +29,6 @@ from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     fine_grained_offloading_group_start,
     get_fine_grained_offloading_context,
 )
-from megatron.core.tensor_parallel import get_cuda_rng_tracker
 from megatron.core.tensor_parallel.mappings import gather_from_sequence_parallel_region
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.identity_op import IdentityOp
