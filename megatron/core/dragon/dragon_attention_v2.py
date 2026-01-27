@@ -954,25 +954,6 @@ class DiffAttentionV2(MegatronModule, ABC):
             log_pos = pos.log() if wsize <= 0 else torch.clamp_max(pos, wsize).log()
             query = (self.softmax_scaler * log_pos) * query
 
-        """# ==================================
-        # q,k splitting for diff attention
-        # ==================================
-        sig_idx, noi_idx = self._signal_noise_local_indices(self.pg_collection.tp.rank(), query.device)
-
-        if packed_seq_params is None:
-            index_heads = 2
-            query_sig, query_noi = query.index_select(index_heads, sig_idx), query.index_select(index_heads, noi_idx)
-            key_sig, key_noi = key.index_select(index_heads, sig_idx), key.index_select(index_heads, noi_idx)
-            value_sig = value.repeat(1, 1, self.num_signal_heads//self.num_noise_heads, 1)
-        else:
-            index_heads = 1
-            query_sig, query_noi = query.index_select(index_heads, sig_idx), query.index_select(index_heads, noi_idx)
-            key_sig, key_noi = key.index_select(index_heads, sig_idx), key.index_select(index_heads, noi_idx)
-            value_sig = value.repeat(1, self.num_signal_heads//self.num_noise_heads, 1)
-
-        # query_sig, key_sig, value_sig: (L, B, H_signal_local, D)
-        # query_noi, key_noi, value    : (L, B, H_noise_local, D)
-        """
         # ==================================
         # core attention computation
         # ==================================
@@ -1034,23 +1015,8 @@ class DiffAttentionV2(MegatronModule, ABC):
                 (core_attn_out,) = fine_grained_offloading_group_commit(
                     core_attn_out, name="core_attn", forced_released_tensors=[query, key, value]
                 )
-        
-        """if not self.config.intra_doc_masking:
-            core_attn_out = core_attn_out.reshape(core_attn_out.size(0), core_attn_out.size(1), -1, self.num_attention_heads//self.num_noise_heads, self.hidden_size_per_attention_head) # (..., num_noise_heads, snr+1, D)
-            attn_sig = core_attn_out[:, :, :, :self.snr, :] # (..., num_noise_heads, snr, D)
-            attn_noi = core_attn_out[:, :, :, self.snr:self.snr+1, :] # (..., num_noise_heads, 1, D)
-        else:
-            core_attn_out = core_attn_out.reshape(core_attn_out.size(0), -1, self.num_attention_heads//self.num_noise_heads, self.hidden_size_per_attention_head) # (..., num_noise_heads, snr+1, D)
-            attn_sig = core_attn_out[:, :, :self.snr, :] # (..., num_noise_heads, snr, D)
-            attn_noi = core_attn_out[:, :, self.snr:self.snr+1, :] # (..., num_noise_heads, 1, D)
 
-        print(attn_sig.shape, attn_noi.shape, lambda_proj.shape)
-
-        lambda_val = lambda_proj.unsqueeze(-1) # (..., H, 1)
-        core_attn_out = attn_sig - torch.sigmoid(lambda_val) * attn_noi # (..., num_noise_heads, snr, D) (each noise head is broadcasted/repeated SNR times)
-        core_attn_out = core_attn_out.view(core_attn_out.size(0), core_attn_out.size(1), -1, self.hidden_size_per_attention_head) # (..., num_signal_heads, D)"""
-
-        core_attn_out = core_attn_out.reshape(*core_attn_out.shape[:-2], self.num_noise_heads, self.snr+1, self.hidden_size_per_attention_head) # (..., H_noise, snr+1, D)
+        core_attn_out = core_attn_out.reshape(*core_attn_out.shape[:-2], self.num_noise_heads_per_partition, self.snr+1, self.hidden_size_per_attention_head) # (..., H_noise_local, snr+1, D)
         attn_sig = core_attn_out[..., :self.snr, :] # (..., H_noise, snr, D)
         attn_noi = core_attn_out[..., self.snr:self.snr + 1, :] # (..., H_noise, 1,   D)
 
