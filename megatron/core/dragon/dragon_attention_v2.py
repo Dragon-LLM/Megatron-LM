@@ -470,24 +470,6 @@ class DiffAttentionV2(MegatronModule, ABC):
                 key, value, block_table = inference_context.key_value_cache(self.layer_number)
         return query, key, value, rotary_pos_emb, attn_mask_type, block_table
 
-    def _signal_noise_local_indices(self, tp_rank: int, device):
-        H_tot = self.num_attention_heads
-        H_local = self.num_attention_heads_per_partition
-        S_tot = self.num_signal_heads
-        N_tot = H_tot - S_tot
-        g = math.gcd(S_tot, N_tot)
-        s_block = S_tot // g
-        n_block = N_tot // g
-        cycle = s_block + n_block
-
-        base = tp_rank * H_local                               # global head offset for this TP rank
-        h_global = torch.arange(H_local, device=device) + base # [H_local]
-        pos = h_global % cycle
-        is_signal = pos < s_block
-        sig_idx = torch.nonzero(is_signal, as_tuple=False).squeeze(-1) # local indices
-        noi_idx = torch.nonzero(~is_signal, as_tuple=False).squeeze(-1)
-        return sig_idx, noi_idx
-
     @abstractmethod
     def get_query_key_value_tensors(
         self, hidden_states
