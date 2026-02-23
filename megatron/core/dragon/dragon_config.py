@@ -121,6 +121,8 @@ class DragonConfig(ModelParallelConfig):
 
     num_attention_heads: int = 0
     """Number of Dragon attention heads."""
+    
+    mamba3_fast: bool = True
 
     mixer_gn: bool = True
 
@@ -133,6 +135,10 @@ class DragonConfig(ModelParallelConfig):
     gate_attn: bool = True
 
     gate_gdn: bool = True
+    
+    use_ddl: bool = False
+    
+    ddl_expand_factor: int = 4
 
     attention_backend: AttnBackend = AttnBackend.auto
     """Attention backend to run. By default we let Dragon engine
@@ -190,7 +196,7 @@ class DragonConfig(ModelParallelConfig):
 
     activation_func_fp8_input_store: bool = False
     """Store the input of MLP activation function in FP8 for backprop to save memory.
-    The stored input is casted back to the original precision before backprop compuatation."""
+    The stored input is casted back to the original precision before backprop computation."""
 
     glu_linear_offset: float = 0.0
     """Offset term in the GLU activation function: activation_func(x[0]) * (x[1] + offset). Only 
@@ -429,6 +435,10 @@ class DragonConfig(ModelParallelConfig):
     fp8_wgrad: bool = True
     """When set to False, override FP8 config options and do the wgrad computation
     in higher precision."""
+
+    fp8_mlp_only: bool = False
+    """When set to True, only apply FP8 precision to the MLP/MoE portion of each layer,
+    keeping the mixer (Mamba/Attention) in BF16. Requires fp8 to be set."""
 
     fp8_dot_product_attention: bool = False
     """When set to True, use the FP8 implementation of Dot Product Attention."""

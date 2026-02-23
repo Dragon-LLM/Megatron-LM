@@ -44,9 +44,9 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
     args = get_args()
     config = core_transformer_config_from_args(args)
     # TODO: this is pretty hacky, find a better way
-    if not is_first_or_last_pipeline_stage(vp_stage) and (
+    if not is_first_or_last_pipeline_stage(vp_stage) and not (args.create_cu_seqlens_in_dataloader and args.pipeline_model_parallel_size > 1) and (
     (not mtp_on_this_rank(config, ignore_virtual=False, vp_stage=vp_stage))):
-        return None, None, None, None, None
+        return None, None, None, None, None, None, None
 
     # get batches based on the TP rank you are on
     batch = get_batch_on_this_tp_rank(
@@ -142,7 +142,7 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
     global stimer
     with stimer(bdata=True):
         vp_stage = get_attr_wrapped_model(model, "vp_stage")
-        tokens, labels, loss_mask, attention_mask, position_ids = get_batch(data_iterator, vp_stage)
+        tokens, labels, loss_mask, attention_mask, position_ids, _, _ = get_batch(data_iterator, vp_stage)
     timers('batch-generator').stop()
 
     with stimer:

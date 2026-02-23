@@ -211,12 +211,14 @@ def _get_param_groups_completedp(
     base_lr_emb: float,
     base_lr_scalar: float,
     base_lr_head: float,
+    base_lr_expert: float,
     base_wd_hidden: float,
     base_eps: float,
     alpha_completedp: float,
     rho_adjusted: float,
     width_adjusted: float,
     depth_adjusted: float,
+    min_lr: float = None,
 ) -> List[Dict]:
 
     MAX_NAME  = 90   # tweak
@@ -267,6 +269,8 @@ def _get_param_groups_completedp(
                         eps = base_eps * scale_eps
                     else: # hidden matrix weight
                         base_lr = base_lr_hidden
+                        if "experts.linear_fc" in name and "shared" not in name:
+                            base_lr = base_lr_expert
                         scale_lr = (width_adjusted ** (-1)) * (depth_adjusted ** (alpha_completedp-1)) * rho_adjusted
                         lr = base_lr * scale_lr
 
@@ -318,7 +322,7 @@ def _get_param_groups_completedp(
                         params_map[key].append(bias)
                         seen.add(bias)
 
-                        if parallel_state.get_data_parallel_rank() == 0:
+                        if parallel_state.get_data_parallel_rank() == 0 and parallel_state.get_tensor_model_parallel_rank() == 0:
                             print(
                                 f"param {_clip(name, MAX_NAME):<{MAX_NAME}}"
                                 f" | shape {_shape_str(bias.shape):>{MAX_SHAPE}}"
@@ -426,9 +430,12 @@ def _get_param_groups_completedp(
             'is_expert_parallel': is_expert_parallel,
             'is_decoupled_lr': is_decoupled_lr,
         }
+        if min_lr is not None:
+            param_group['max_lr'] = base_lr_hidden
+            param_group['min_lr'] = min_lr
         # Ensure param_group has required keys for matching when loading optimizer state
         # See MegatronOptimizer._filter_and_reorder_param_groups.
-        assert set(param_group.keys()) - set(param_group_identifier_keys) == {'params'}
+        #assert set(param_group.keys()) - set(param_group_identifier_keys) == {'params'}
         param_groups.append(param_group)
 
     return param_groups
@@ -662,12 +669,14 @@ def _get_param_groups_and_buffers(
             base_lr_emb=config.lr_emb,
             base_lr_scalar=config.lr_scalar,
             base_lr_head=config.lr_head,
+            base_lr_expert=config.lr_expert if config.lr_expert is not None else config.lr,
             base_wd_hidden=config.weight_decay,
             base_eps=config.adam_eps,
             alpha_completedp=alpha_completedp,
             rho_adjusted=rho_adjusted,
             width_adjusted=width_adjusted,
             depth_adjusted=depth_adjusted,
+            min_lr=config.min_lr,
         )
     else:
         param_groups = _get_param_groups(

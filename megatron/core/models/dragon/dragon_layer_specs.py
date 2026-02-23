@@ -31,7 +31,7 @@ from megatron.core.dragon.dragon_block import (
 from megatron.core.dragon.dragon_attention import SelfDiffAttention, SelfDiffAttentionSubmodules
 from megatron.core.dragon.dragon_attention_v2 import SelfDiffAttentionV2, SelfDiffAttentionV2Submodules
 from megatron.core.dragon.dragon_gated_delta_net import GatedDeltaNet, GatedDeltaNetSubmodules
-from megatron.core.dragon.dragon_mamba3 import Mamba3, Mamba3Submodules
+from megatron.core.dragon.dragon_mamba3 import Mamba3Submodules, FastMamba3 #, TPFastMamba3
 from megatron.core.transformer.mlp import MLP, MLPSubmodules
 from megatron.core.transformer.moe.moe_layer import MoELayer, MoESubmodules
 from megatron.core.transformer.moe.experts import TEGroupedMLP
@@ -83,6 +83,8 @@ from megatron.core.extensions.transformer_engine import TELinear, TELayerNormCol
 
 def get_dragon_block_spec(
     config: DragonConfig,
+    vp_stage: Optional[int] = None,
+    pp_rank: Optional[int] = None,
 ):
     backend = TESpecProvider()
     attention = ModuleSpec(
@@ -114,14 +116,21 @@ def get_dragon_block_spec(
         )
     )
     mamba3 = ModuleSpec(
-        module=Mamba3,
+        module=FastMamba3, #if config.tensor_model_parallel_size == 1 else TPFastMamba3,
         submodules=Mamba3Submodules(
             in_proj=TELayerNormColumnParallelLinear,
             b_norm=TENorm,
             c_norm=TENorm,
             rope_proj=TELinear,
+            output_norm=TENorm if config.mamba3_fast else IdentityOp,
+            dyn_proj=TELinear if config.mamba3_fast else IdentityOp,
         ),
     )
+    if backend.fuse_layernorm_and_linear():
+        fuse_pre_mlp_layernorm = True
+    else:
+        fuse_pre_mlp_layernorm = False
+
     # MLP.
     mlp = ModuleSpec(
         module=MLP,
@@ -130,6 +139,7 @@ def get_dragon_block_spec(
             linear_fc2=TERowParallelLinear,
             activation_func=backend.activation_func() if config.use_te_activation_func else None,
         ),
+        metainfo={"fuse_pre_mlp_layernorm": fuse_pre_mlp_layernorm},
     )
     # MoE.
     experts = ModuleSpec(
@@ -137,6 +147,7 @@ def get_dragon_block_spec(
         submodules=MLPSubmodules(
             linear_fc1=TEColumnParallelGroupedLinear, # no layernorm. it's done as a standalone.
             linear_fc2=TERowParallelGroupedLinear,
+            activation_func=backend.activation_func() if config.use_te_activation_func else None,
         ),
     )
     shared_experts = ModuleSpec(
@@ -145,7 +156,7 @@ def get_dragon_block_spec(
             linear_fc1=TEColumnParallelLinear, # no layernorm. it's done as a standalone.
             linear_fc2=TERowParallelLinear,
             activation_func=backend.activation_func() if config.use_te_activation_func else None,
-        ),
+        )
     )
     moe = ModuleSpec(
         module=MoELayer,
@@ -153,7 +164,8 @@ def get_dragon_block_spec(
         submodules=MoESubmodules(
             experts=experts,
             shared_experts=shared_experts,
-        )
+        ),
+        metainfo={"fuse_pre_mlp_layernorm": False},  
     )
     layer = ModuleSpec(
         module=DragonLayer,
@@ -170,8 +182,13 @@ def get_dragon_block_spec(
             moe=moe,
         ),
     )
+    if vp_stage is not None or pp_rank is not None:
+        num_layers = get_num_layers_to_build(config, vp_stage, pp_rank)
+    else:
+        num_layers = config.num_layers
+    
     dragon_block_spec = DragonBlockSubmodules(
-        layer_specs=[layer] * config.num_layers,
+        layer_specs=[layer] * num_layers,
         final_layer_norm=TENorm,
     )
 

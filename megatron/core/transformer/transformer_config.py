@@ -41,6 +41,8 @@ class TransformerConfig(ModelParallelConfig):
     ####################
     # model architecture
     ####################
+    use_uscaling: bool = False
+    use_completedp: bool = False
 
     num_layers: int = 0
     """Number of transformer layers in a transformer block."""

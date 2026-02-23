@@ -12,7 +12,10 @@ import math
 import os
 import sys
 from typing import List, Optional
+from functools import lru_cache
 
+import torch
+import torch.nn as nn
 import torch.distributed
 
 from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
@@ -155,8 +158,11 @@ def print_datetime(string):
     time_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     print_rank_0(f'[{string}] datetime: {time_str} ')
 
-
+_FLOPS_CACHE = {}
 def num_floating_point_operations(args, batch_size):
+    cache_key = (id(args), batch_size)
+    if cache_key in _FLOPS_CACHE:
+        return _FLOPS_CACHE[cache_key]
     def calculate_layer_counts():
         """Calculate the number of attention, Mamba, and MLP layers."""
         if args.hybrid_override_pattern:
@@ -577,9 +583,9 @@ def num_floating_point_operations(args, batch_size):
         mixer_attn_flops = 3 * dragon_attention_layer_flops(batch_size, args.seq_length, args.hidden_size, args.num_attention_heads, args.num_signal_heads, args.kv_channels, args.tpa_rank)
         mixer_gdn_flops = 3 * gdn_layer_flops(batch_size, args.seq_length, args.hidden_size, args.linear_key_head_dim, args.linear_value_head_dim, args.linear_num_key_heads, args.linear_conv_kernel_dim)
         mixer_mamba3_flops = 3 * mamba3_mimo_layer_flops(batch_size, args.seq_length, args.hidden_size, args.mamba_state_dim, args.mamba_head_dim, args.mamba_num_groups, args.mamba_num_heads, args.mamba_mimo_dim, args.mamba_mimo_proj_block_order)
-        num_attn_layers = args.layers_mixer_config.count("T")
+        num_attn_layers = args.layers_mixer_config.count("V")
         num_gdn_layers = args.layers_mixer_config.count("g")
-        num_mamba3_layers = args.layers_mixer_config.count("3")
+        num_mamba3_layers = args.layers_mixer_config.count("M")
 
         total_floating_point_operations = (
             # MLP
@@ -622,13 +628,13 @@ def num_floating_point_operations(args, batch_size):
 
     # Main entrypoint for FLOPs calculation.
     if args.is_dragon_model:
-        return dragon_flops()
+        flops = dragon_flops()
     elif args.is_hybrid_model:
         # Calculate the number of each type of layer.
         num_attn_layers, num_mamba_layers, num_mlp_layers = calculate_layer_counts()
 
         # Compute hybrid model FLOPs.
-        return hybrid_flops(
+        flops = hybrid_flops(
             batch_size=batch_size,
             seq_len=args.seq_length,
             hidden_size=args.hidden_size,
@@ -649,8 +655,9 @@ def num_floating_point_operations(args, batch_size):
         )
     else:
         # Compute standard Transformer model FLOPs.
-        return transformer_flops()
-
+        flops = transformer_flops()
+    _FLOPS_CACHE[cache_key] = flops
+    return flops
 
 def get_start_time_from_progress_log():
     """
@@ -1178,13 +1185,27 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
         config = get_model_config(model[0])
         model = [Float16Module(config, model_module) for model_module in model]
 
+    """def _setattr_by_dotted_name(root: nn.Module, dotted: str, new_value):
+        parts = dotted.split(".")
+        parent = root
+        for p in parts[:-1]:
+            parent = getattr(parent, p)
+        setattr(parent, parts[-1], new_value)
+    def promote_selected_params_to_fp32(root: nn.Module, match_any: tuple[str, ...]):
+        for name, p in list(root.named_parameters()):
+            if any(key in name for key in match_any):
+                new_p = nn.Parameter(p.detach().to(torch.float32), requires_grad=p.requires_grad)
+                _setattr_by_dotted_name(root, name, new_p)
+    for m in model:
+        promote_selected_params_to_fp32(
+            m,
+            match_any=("B_bias", "C_bias", "in_proj_mimo_x", "in_proj_mimo_z", "out_proj_mimo"),
+        )"""
+
     # Materialize tensors on meta device (GPU allocation) if not using FSDP2 and not using Megatron FSDP.
     if args.init_model_with_meta_device and not args.use_torch_fsdp2 and not args.use_megatron_fsdp:
         #for model_module in model:
         model = [to_empty_if_meta_device(model_module, device=torch.device("cuda")) for model_module in model]
-
-
-
 
     # Before TE2.x: The model_module.bfloat16()/model_module.half() above will call the inplace
     #               copy of TE's Float8Tensor, which will write an unwanted value (amax calculated
@@ -1313,7 +1334,7 @@ def get_optimizer_param_scheduler(optimizer):
         wd_incr_style=args.weight_decay_incr_style,
         slw_warmup_steps=args.slw_warmup_steps,
         slw_start=args.slw_start,
-        slw_end=args.seq_length,
+        slw_end=args.slw_end,
         slw_increment=args.slw_increment,
         global_batch_size=args.global_batch_size,
         optim=args.optimizer,
@@ -1324,7 +1345,7 @@ def get_optimizer_param_scheduler(optimizer):
         beta3_warmup_steps=args.ademamix_beta3_warmup_steps if args.ademamix_beta3_warmup_steps is not None else args.train_iters,
         alpha_warmup_steps=args.ademamix_alpha_warmup_steps if args.ademamix_alpha_warmup_steps is not None else args.train_iters,
         use_completedp=args.use_completedp,
-        rhosq_adjusted=args.train_iters_base / args.train_iters,
+        rhosq_adjusted=args.train_iters_base / args.train_iters if args.use_completedp else None,
         use_checkpoint_opt_param_scheduler=args.use_checkpoint_opt_param_scheduler,
         override_opt_param_scheduler=args.override_opt_param_scheduler,
         wsd_decay_steps=wsd_decay_steps,
@@ -1376,9 +1397,9 @@ def setup_model_and_optimizer(
             args.use_uscaling,
             args.use_completedp,
             args.completedp_alpha,
-            math.sqrt(args.train_iters_base / args.train_iters),
-            args.hidden_size / args.hidden_size_base,
-            len(args.layers_mixer_config) / len(args.layers_mixer_config_base),
+            math.sqrt(args.train_iters_base / args.train_iters) if args.use_completedp else None,
+            args.hidden_size / args.hidden_size_base if args.use_completedp else None,
+            len(args.layers_mixer_config) / len(args.layers_mixer_config_base) if args.use_completedp else None,
             no_wd_decay_cond,
             scale_lr_cond,
             lr_mult,
@@ -1917,6 +1938,8 @@ def training_log(
             elapsed_time_per_iteration * 10**12 * args.world_size
         )
 
+        token_throughput = batch_size * args.seq_length / elapsed_time_per_iteration
+
         one_logger_utils.track_e2e_metrics(args.log_throughput, throughput)
 
         if args.log_timers_to_tensorboard:
@@ -1936,11 +1959,13 @@ def training_log(
         )
         if args.log_throughput:
             log_string += f' throughput per GPU (TFLOP/s/GPU): {throughput:.1f} |'
+            log_string += f' token throughput (Tokens/s): {token_throughput:.1f} |'
             if args.log_timers_to_tensorboard:
                 if writer:
                     writer.add_scalar('throughput', throughput, iteration)
                 if wandb_writer:
                     wandb_writer.log({'throughput': throughput}, iteration)
+
         if args.log_energy:
             energy = (energy_monitor.lap() / total_iterations) / args.world_size
             power = energy / elapsed_time_per_iteration
@@ -2719,7 +2744,7 @@ def train(
             loss_scale = 1.0
         params_norm = None
 
-        if args.log_params_norm:
+        if args.log_params_norm and iteration % args.log_interval == 0:
             params_norm = calc_params_l2_norm(model)
         learning_rate = None
         decoupled_learning_rate = None
@@ -3037,7 +3062,7 @@ def evaluate_and_print_results(
 
         # with full validation we need to distribute eval_iters to all ranks
         if mpu.get_tensor_model_parallel_rank() == 0:
-            eval_iters = torch.tensor(args.eval_iters, dtype=torch.long, device='cuda')
+            eval_iters = torch.tensor(eval_iters, dtype=torch.long, device='cuda')
         else:
             eval_iters = torch.tensor([0] * len(eval_iters), dtype=torch.long, device='cuda')
         torch.distributed.broadcast(eval_iters, 0)
@@ -3253,7 +3278,24 @@ def build_train_valid_test_data_iterators(build_train_valid_test_datasets_provid
                 else:
                     args.eval_iters = [len(dl) for dl in valid_dataloaders]
             else:
-                args.eval_iters = len(valid_dataloaders[0])
+                if valid_dataloaders[0] is not None:
+                    args.eval_iters = len(valid_dataloaders[0])
+                else:
+                    args.eval_iters = 0
+
+            # Broadcast eval_iters from TP rank 0 to all TP ranks so that
+            # args.eval_iters is consistent across ranks (needed for checkpoint
+            # validation which compares args across ranks).
+            if not args.multiple_validation_sets and torch.distributed.is_initialized():
+                eval_iters_tensor = torch.tensor(
+                    [args.eval_iters], dtype=torch.long, device='cuda'
+                )
+                torch.distributed.broadcast(
+                    eval_iters_tensor,
+                    mpu.get_tensor_model_parallel_src_rank(),
+                    group=mpu.get_tensor_model_parallel_group(),
+                )
+                args.eval_iters = eval_iters_tensor.item()
 
         if args.multiple_validation_sets:
             if valid_dataloaders[0] is None:

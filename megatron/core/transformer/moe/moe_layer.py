@@ -132,7 +132,7 @@ class MoELayer(BaseMoELayer):
         # Initialize router
         self.router = TopKRouter(config=self.config, input_scalar=input_scalar, pg_collection=pg_collection)
 
-        if config.moe_routed_input_dim:
+        if hasattr(config, "moe_routed_input_dim") and config.moe_routed_input_dim:
             self.down_proj = TELinear(
                 config.hidden_size,
                 config.moe_routed_input_dim,
@@ -215,8 +215,8 @@ class MoELayer(BaseMoELayer):
         This method uses the router to determine which experts to send each token to,
         producing routing probabilities and a mapping.
         """
-        probs, routing_map, stashed_hs = self.router(hidden_states, stashed_hs)
-        return probs, routing_map, stashed_hs
+        probs, routing_map, top_indices, stashed_hs = self.router(hidden_states, stashed_hs)
+        return probs, routing_map, top_indices, stashed_hs
 
     @maybe_skip_or_early_return_by_cudagraph("preprocess")
     def preprocess(
@@ -324,8 +324,8 @@ class MoELayer(BaseMoELayer):
         def custom_forward(hidden_states, stashed_hs):
             try:
                 shared_expert_output = self.shared_experts_compute(hidden_states)
-                probs, routing_map, stashed_hs = self.route(hidden_states, stashed_hs)
-                if self.config.moe_routed_input_dim:
+                probs, routing_map, top_indices, stashed_hs = self.route(hidden_states, stashed_hs)
+                if hasattr(self.config, "moe_routed_input_dim") and self.config.moe_routed_input_dim:
                     hidden_states, _ = self.down_proj(hidden_states)
                 hidden_states, probs, residual = self.preprocess(hidden_states, probs, routing_map)
             except MoECudaGraphPartialCaptureSignal as e:
@@ -339,11 +339,11 @@ class MoELayer(BaseMoELayer):
             dispatched_input, probs = self.dispatch(hidden_states, probs)
             output, mlp_bias = self.routed_experts_compute(dispatched_input, probs, residual)
             output = self.combine(output)
-            if self.config.moe_routed_input_dim:
+            if hasattr(self.config, "moe_routed_input_dim") and self.config.moe_routed_input_dim:
                 output, _ = self.up_proj(output)
             if shared_expert_output is not None:
                 output = output + shared_expert_output
-            return output, mlp_bias, routing_map, stashed_hs
+            return output, mlp_bias, routing_map, top_indices, stashed_hs
 
         if self.moe_layer_recompute:
             if self.config.fp8:

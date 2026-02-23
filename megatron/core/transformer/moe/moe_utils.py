@@ -626,7 +626,7 @@ def topk_routing_with_score_function(
         routing_probs = torch.zeros_like(logits).scatter(1, top_indices, probs)
         routing_map = torch.zeros_like(logits).int().scatter(1, top_indices, 1).bool()
 
-    return routing_probs, routing_map
+    return routing_probs, routing_map, top_indices
 
 
 def compute_routing_scores_for_aux_loss(

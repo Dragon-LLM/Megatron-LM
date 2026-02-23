@@ -36,6 +36,7 @@ from megatron.core.utils import (
     get_pg_rank,
     make_viewless_tensor,
 )
+from .dragon_ddl import ResidualShortConvCompressor
 
 try:
     import transformer_engine.pytorch as te  # pylint: disable=unused-import
@@ -202,6 +203,7 @@ def get_num_layers_to_build(
             num_layers_to_build -= 1
             assert num_layers_to_build >= 0, f"Not enough layers in the last virtual pipeline stage"
 
+    #print(f"Building {num_layers_to_build} layers on pp_rank {pp_rank}, vp_stage {vp_stage}")
     return num_layers_to_build
 
 
@@ -254,9 +256,11 @@ def _get_block_submodules(
     # `BaseTransformerLayer` from the `transformer_layer.py` file.
     elif isinstance(spec, ModuleSpec):
         if issubclass(spec.module, DragonBlock):
+            #print("Going through DragonBlock spec returning : ", spec.submodules)
             return spec.submodules
         elif issubclass(spec.module, BaseDragonLayer):
             num_layers = get_num_layers_to_build(config, vp_stage, pp_rank)
+            #print(f"Building {num_layers} layers for vp_stage {vp_stage}, pp_rank {pp_rank}")
             return DragonBlockSubmodules(
                 layer_specs=[spec] * num_layers, layer_norm=LayerNormImpl
             )
@@ -335,10 +339,14 @@ class DragonBlock(GraphableMegatronModule, MegatronModule):
         # if self.apply_query_key_layer_scaling:
         #     coeff = self.layer_number
         #     self.norm_factor *= coeff
-        def build_layer(layer_spec, layer_number, layer_mixer_type, layer_mlp_type, vocab_size, use_ve):
+        def build_layer(layer_spec, layer_number, layers_mlp_config, vocab_size, use_ve):
+            #print(f"Building layer {layer_number} in vp_stage {self.vp_stage}")
             global_layer_number = layer_number + get_dragon_layer_offset(
                 self.config, self.vp_stage, get_pg_rank(self.pg_collection.pp)
             )  # 1-based index
+            #print("Global layer number: ", global_layer_number, "vp_stage: ", self.vp_stage, "pp_rank: ", get_pg_rank(self.pg_collection.pp), "layer_number: ", layer_number, "len layers_mixer_config: ", len(self.config.layers_mixer_config))
+            layer_mixer_type = self.config.layers_mixer_config[global_layer_number]
+            layer_mlp_type = layers_mlp_config[global_layer_number]
             if self.config.heterogeneous_block_specs:
                 layer_config = self.config.get_config_for_layer(global_layer_number)
             else:
@@ -362,9 +370,9 @@ class DragonBlock(GraphableMegatronModule, MegatronModule):
                     config=layer_config,
                     layer_mixer_type=layer_mixer_type,
                     layer_mlp_type=layer_mlp_type,
-                    layer_number=layer_number,
+                    layer_number=layer_number + 1,  # 1-based index for human readability + LNS
                     vocab_size=vocab_size,
-                    use_ve=use_ve,
+                    use_ve=use_ve and self.config.layers_ve_config[global_layer_number],
                     pg_collection=self.pg_collection,
                     vp_stage=self.vp_stage,
                 )
@@ -376,9 +384,10 @@ class DragonBlock(GraphableMegatronModule, MegatronModule):
             layers_mlp_config[: self.config.num_first_mlp] = ['d'] * self.config.num_first_mlp
         else:
             layers_mlp_config = list('d' * self.config.num_layers)
+        self.submodules.layer_specs
         self.layers = torch.nn.ModuleList(
             [
-                build_layer(layer_spec, i + 1, self.config.layers_mixer_config[i], layers_mlp_config[i], vocab_size, self.config.use_value_embeddings and int(self.config.layers_ve_config[i]))
+                build_layer(layer_spec, i, layers_mlp_config, vocab_size, self.config.use_value_embeddings)
                 for i, layer_spec in enumerate(self.submodules.layer_specs)
             ]
         )
@@ -387,6 +396,8 @@ class DragonBlock(GraphableMegatronModule, MegatronModule):
         # In pipeline parallelism, we want to add this LN only to the last stage of the pipeline
         # self.post_process and self.post_layer_norm guide this behavior
         if self.has_final_layernorm_in_this_stage():
+            if self.config.use_ddl:
+                self.readout = ResidualShortConvCompressor(self.config)
             self.final_layernorm = build_module(
                 self.submodules.final_layer_norm,
                 config=self.config,
@@ -394,6 +405,7 @@ class DragonBlock(GraphableMegatronModule, MegatronModule):
                 eps=self.config.layernorm_epsilon,
             )
         else:
+            self.readout = None
             self.final_layernorm = None  # Either this or nn.Identity
 
     def has_final_layernorm_in_this_stage(self):
@@ -668,6 +680,8 @@ class DragonBlock(GraphableMegatronModule, MegatronModule):
         #   is called here to be future-proof and corner-case-proof.
         hidden_states = make_viewless_tensor(inp=hidden_states, requires_grad=True, keep_graph=True)
 
+        #print("Start of block shape: ", hidden_states.shape, flush=True)
+        
         if self.config.sequence_parallel:
             rng_context = tensor_parallel.get_cuda_rng_tracker().fork()
         else:
@@ -679,7 +693,7 @@ class DragonBlock(GraphableMegatronModule, MegatronModule):
         # we can wrap fp8_context within the for loop over layers, so that we can fine-grained
         # control which layer will be fp8 or bf16
         # For FP4: NVFP4BlockScaling doesn't have delayed scaling, always uses inner context
-        if self.config.fp8:
+        if self.config.fp8 and not self.config.fp8_mlp_only:
             use_outer_quantization_context = self.config.fp8_recipe == Fp8Recipe.delayed
             use_inner_quantization_context = self.config.fp8_recipe != Fp8Recipe.delayed
             outer_quantization_context = (
@@ -757,10 +771,13 @@ class DragonBlock(GraphableMegatronModule, MegatronModule):
 
         # Final layer norm.
         if self.final_layernorm is not None:
+            if self.config.use_ddl:
+                hidden_states = self.readout(hidden_states)
             hidden_states = self.final_layernorm(hidden_states)
             # TENorm produces a "viewed" tensor. This will result in schedule.py's
             # deallocate_output_tensor() throwing an error, so a viewless tensor is
             # created to prevent this.
+        if self.final_layernorm is not None or self.config.use_ddl:
             hidden_states = make_viewless_tensor(
                 inp=hidden_states, requires_grad=True, keep_graph=True
             )
@@ -769,7 +786,7 @@ class DragonBlock(GraphableMegatronModule, MegatronModule):
         # on the computational graph and will lead to unexpected errors in pipeline schedules.
         if not self.pre_process and len(self.layers) == 0 and not self.final_layernorm:
             hidden_states = hidden_states.clone()
-
+        #print(f"[{parallel_state.get_pipeline_model_parallel_rank()}] End of block shape: {hidden_states.shape}", flush=True)
         return hidden_states
 
     def sharded_state_dict(

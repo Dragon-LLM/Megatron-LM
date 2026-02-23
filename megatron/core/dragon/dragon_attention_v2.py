@@ -262,36 +262,33 @@ class DiffAttentionV2(MegatronModule, ABC):
         rotary_pos_emb=None,
         attn_mask_type=None,
         attention_bias=None,
+        window_size=None,
+        concat_heads=False,
         packed_seq_params=None,
     ):
-        """Forward method with selective activation checkpointing."""
-
-        def custom_forward(*inputs):
-            query = inputs[0]
-            key = inputs[1]
-            value = inputs[2]
-            attention_mask = inputs[3]
-            attn_mask_type = inputs[5]
-            attn_mask_type = AttnMaskType(attn_mask_type.item())
-            output_ = self.core_attention(
-                query,
-                key,
-                value,
-                attention_mask,
-                attn_mask_type=attn_mask_type,
+        def custom_forward(q, k, v, amask, _rotary, attn_mask_type_t):
+            attn_mask_type_ = AttnMaskType(attn_mask_type_t.item())
+            out = self.core_attention(
+                q.bfloat16(),
+                k.bfloat16(),
+                v.bfloat16(),
+                amask,
+                attn_mask_type=attn_mask_type_,
                 attention_bias=attention_bias,
+                window_size=window_size,
+                concat_heads=concat_heads,
                 packed_seq_params=packed_seq_params,
             )
-            return output_
+            return out
 
         if attn_mask_type is None:
             attn_mask_type = self.attn_mask_type
-        attn_mask_type = torch.tensor([attn_mask_type.value], dtype=torch.int)
-        hidden_states = tensor_parallel.checkpoint(
-            custom_forward, False, query, key, value, attention_mask, rotary_pos_emb, attn_mask_type
-        )
+        attn_mask_type_t = torch.tensor([attn_mask_type.value], dtype=torch.int)
 
-        return hidden_states
+        return tensor_parallel.checkpoint(
+            custom_forward, False,
+            query, key, value, attention_mask, rotary_pos_emb, attn_mask_type_t
+        )
 
     def _allocate_memory(self, inference_max_sequence_length, batch_size, dim, dtype):
         """Allocate memory to store kv cache during inference."""
@@ -710,9 +707,11 @@ class DiffAttentionV2(MegatronModule, ABC):
             (Tuple[Tensor, Tensor]) Attention output and bias.
 
         """
+        #print("attention mask is None ?", attention_mask is None)    
+        #print("window size:", window_size)
 
         if window_size is not None and window_size[0] != self.wsize_prev and self.pg_collection.tp.rank()==0 and self.pg_collection.dp.rank()==0:
-            print(f"[ATTN] Window size changed: {self.wsize_prev} -> {window_size[0]}")
+            print(f"[ATTN] Window size changed: {self.wsize_prev} -> {window_size[0]}", flush=True)
             self.wsize_prev = window_size[0]
 
         # Check if we need to skip RoPE
@@ -775,7 +774,7 @@ class DiffAttentionV2(MegatronModule, ABC):
             )
 
         attn_mask_type = self.attn_mask_type
-        query, A_k, A_v, B_k, B_v, alpha_k, alpha_v, lambda_proj, gate = qkv_output
+        query, A_k, A_v, B_k, B_v, alpha_k, alpha_v, lambda_proj, gate, normed_hidden_states = qkv_output
 
         # q: [L, B, H_local, dk]
         # A_k: [L, B, H_noise_local, r], A_v: [L, B, H_noise_local, r]
@@ -785,8 +784,8 @@ class DiffAttentionV2(MegatronModule, ABC):
 
         B_k = rearrange(B_k, '... (r d) -> ... r d', r=self.config.tpa_rank)
         B_v = rearrange(B_v, '... (r d) -> ... r d', r=self.config.tpa_rank)
-        key = torch.matmul(A_k, B_k).mul_(self.inv_rank)
-        value = torch.matmul(A_v, B_v).mul_(self.inv_rank)
+        key = torch.matmul(A_k, B_k)
+        value = torch.matmul(A_v, B_v)
 
         # value embeddings
         if self.use_ve:
@@ -799,12 +798,16 @@ class DiffAttentionV2(MegatronModule, ABC):
         # kv shift
         # =====================
         if self.config.token_shift:
+            nvtx_range_push(suffix="token_shift")
             key, value = self._torch_compiled_token_shift(key, value, alpha_k, alpha_v, position_ids=packed_seq_params.position_ids if packed_seq_params is not None else None)
+            nvtx_range_pop(suffix="token_shift")
 
         # =====================
         # QK norm
         # =====================
+        nvtx_range_push(suffix="normalize_qk")
         query, key = self.normalize_qk(query, key)
+        nvtx_range_pop(suffix="normalize_qk")
 
         # ===================================================
         # Adjust key, value, and rotary_pos_emb for inference
@@ -949,15 +952,22 @@ class DiffAttentionV2(MegatronModule, ABC):
                 attention_mask,
                 attn_mask_type=attn_mask_type,
                 attention_bias=attention_bias,
+                window_size=window_size,
+                concat_heads=False,
                 packed_seq_params=packed_seq_params,
             ) # (L, B, H_signal_local, D)
-            assert len(core_attn_out.shape) == 4
+            if not self.config.intra_doc_masking:
+                assert len(core_attn_out.shape) == 4
+            else:
+                assert len(core_attn_out.shape) == 3
         else:
             if self.offload_core_attention and self.training:
                 query = fine_grained_offloading_group_start(query, name="core_attn")
             if inference_context is None or inference_context.is_static_batching():
                 # Static batching attention kernel.
                 with get_fine_grained_offloading_context(self.offload_core_attention):
+                    assert window_size is not None
+                    assert window_size[0] > 0
                     core_attn_out = self.core_attention(
                         query.bfloat16(),
                         key.bfloat16(),
@@ -979,7 +989,7 @@ class DiffAttentionV2(MegatronModule, ABC):
                 # Dynamic batching attention kernel.
                 cu_query_lengths, max_seqlen_q = inference_context.cu_query_lengths()
                 cu_kv_lengths, kv_lengths, max_seqlen_k = inference_context.cu_kv_lengths()
-
+                assert False
                 core_attn_out = self.flash_decode_and_prefill(
                     query,
                     key,
@@ -1012,6 +1022,8 @@ class DiffAttentionV2(MegatronModule, ABC):
             # note that batch is a dummy dimension in the packed case
             core_attn_out = core_attn_out.unsqueeze(1)
         nvtx_range_pop(suffix="core_attention")
+        
+        return core_attn_out, normed_hidden_states
 
         # Output gate
         if gate is not None:
@@ -1019,7 +1031,7 @@ class DiffAttentionV2(MegatronModule, ABC):
             core_attn_out = self._torch_compiled_output_gate(core_attn_out, gate)
             nvtx_range_pop(suffix="output_gate")
 
-        return core_attn_out
+        return core_attn_out, normed_hidden_states
 
     @torch.compile
     def _torch_compiled_token_shift(self, key, value, alpha_k, alpha_v, position_ids=None):
@@ -1156,8 +1168,8 @@ class SelfDiffAttentionV2(DiffAttentionV2):
             parallel_mode='duplicated',
             is_expert=False,
             tp_comm_buffer_name='BkBv',
-            alpha_fwd=input_scalar,
-            alpha_bwd=input_scalar,
+            alpha_fwd=input_scalar * self.inv_rank,
+            alpha_bwd=input_scalar * self.inv_rank,
         )
         w = self.linear_BkBv.weight
         b = getattr(self.linear_BkBv, "bias", None)
@@ -1309,7 +1321,7 @@ class SelfDiffAttentionV2(DiffAttentionV2):
         if self.config.test_mode:
             self.run_realtime_tests()
 
-        return q, A_k, A_v, B_k, B_v, alpha_k, alpha_v, lambda_proj, gate
+        return q, A_k, A_v, B_k, B_v, alpha_k, alpha_v, lambda_proj, gate, normed_hidden_states
 
     def normalize_qk(self, q, k):
         if self.q_layernorm is not None:

@@ -149,7 +149,7 @@ def dragon_builder(args, pre_process, post_process, vp_stage=None, config=None):
 
     model = DragonModel(
         config=config,
-        dragon_layer_spec=get_dragon_block_spec(config),
+        dragon_layer_spec=get_dragon_block_spec(config, vp_stage),
         vocab_size=args.padded_vocab_size,
         max_sequence_length=args.max_position_embeddings,
         pre_process=pre_process,

@@ -13,6 +13,7 @@ from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.models.common.embeddings import YarnRotaryEmbedding
 from megatron.core.models.common.embeddings.language_model_embedding import LanguageModelEmbedding
+from megatron.core.dragon.dragon_ddl import InputEmbedShortConvExpander
 from megatron.core.models.common.embeddings.rotary_pos_embedding import (
     MultimodalRotaryEmbedding,
     RotaryEmbedding,
@@ -151,6 +152,9 @@ class DragonModel(LanguageModule):
                 scatter_to_sequence_parallel=scatter_embedding_sequence_parallel,
                 tp_group=self.pg_collection.tp,
             )
+            if self.config.use_ddl:
+                self.input_conv = InputEmbedShortConvExpander(self.config)
+                self.input_conv.reset_parameters_identity()
 
         if self.position_embedding_type == 'rope' and not self.config.multi_latent_attention:
             self.rotary_pos_emb = RotaryEmbedding(
@@ -301,7 +305,13 @@ class DragonModel(LanguageModule):
         if decoder_input is not None:
             pass
         elif self.pre_process:
+            #print("Applying embedding layer to input_ids with shape ", input_ids.shape, flush=True)
             decoder_input = self.embedding(input_ids=input_ids, position_ids=position_ids)
+            #print("Output of embedding layer has shape ", decoder_input.shape, flush=True)
+            if self.config.use_ddl:
+                #print("Using DDL, applying input_conv", flush=True)
+                decoder_input = self.input_conv.forward(decoder_input)
+                #print("DDL output shape: ", decoder_input.shape, flush=True)
         else:
             # intermediate stage of pipeline
             # decoder will get hidden_states from encoder.input_tensor
@@ -479,6 +489,11 @@ class DragonModel(LanguageModule):
         rotary_pos_cos_sin = preproc_output[5] if len(preproc_output) == 6 else None
 
         # Run decoder.
+        #rank = parallel_state.get_pipeline_model_parallel_rank()
+        #if decoder_input is not None:
+            #print(f"[{rank}] Running decoder with decoder_input shape ", decoder_input.shape)
+        #else:
+            #print(f"[{rank}] Running decoder without decoder_input, it will get input from previous pipeline stage")    
         hidden_states = self.decoder(
             hidden_states=decoder_input,
             attention_mask=attention_mask,

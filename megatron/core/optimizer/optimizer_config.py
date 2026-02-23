@@ -33,13 +33,16 @@ class OptimizerConfig:
     """Learning rate multiplier for output head layers. uscaling only"""
 
     lr_emb: Optional[float] = None
-    """Initial learning rate for embedding layers. completed only"""
+    """Initial learning rate for embedding layers. completedp only"""
 
     lr_scalar: Optional[float] = None
-    """Initial learning rate for scalar parameters (e.g., layernorm and bias). completed only"""
+    """Initial learning rate for scalar parameters (e.g., layernorm and bias). completedp only"""
 
     lr_head: Optional[float] = None
-    """Initial learning rate for output head layers. completed only"""
+    """Initial learning rate for output head layers. completedp only"""
+
+    lr_expert: Optional[float] = None
+    """Initial learning rate for routed expert layers. completedp only"""
 
     min_lr: Optional[float] = None
     """Minumum value for learning rate. The scheduler clip values below this threshold."""
@@ -130,7 +133,7 @@ class OptimizerConfig:
     optimizer.
     """
 
-    adam_eps: float = 1e-08
+    adam_eps: float = 1e-8
     """Term added to the denominator to improve numerical stability in Adam optimizer."""
 
     decoupled_weight_decay: bool = True
@@ -265,8 +268,8 @@ class OptimizerConfig:
 
         if self.use_precision_aware_optimizer:
             assert (
-                self.optimizer == 'adam'
-            ), '--use-precision-aware-optimizer only supported with adam'
+                self.optimizer == 'adam' or self.optimizer == 'ademamix'
+            ), '--use-precision-aware-optimizer only supported with adam or ademamix'
             assert (
                 self.use_distributed_optimizer
             ), '--use-precision-aware-optimizer only supported with distributed optimizer'

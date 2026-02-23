@@ -462,6 +462,25 @@ class _ParamAndGradBucketGroup:
         if self.ddp_config.num_distributed_optimizer_instances > 1:
             torch.cuda.default_stream().wait_stream(self.communication_stream)
             return
+        # === DEBUG INJECTION START ===
+        if self.grad_reduce_handle is None:
+            rank = torch.distributed.get_rank()
+            print(f"\n[Rank {rank}] DEBUG: Found bucket with missing gradients!", flush=True)
+            
+            missing_params = []
+            for p in self.params:
+                # Check for gradient availability (main_grad for Megatron, .grad for standard PyTorch)
+                has_grad = (hasattr(p, 'main_grad') and p.main_grad is not None) or (p.grad is not None)
+                
+                # If specific to Megatron's internal tracking, we can just check if the hook fired
+                # But checking .grad is usually sufficient to identify unused params
+                if not has_grad:
+                    missing_params.append(p)
+            
+            print(f"[Rank {rank}] The following {len(missing_params)} parameters did not receive gradients:", flush=True)
+            for i, p in enumerate(missing_params):
+                print(f"  {i+1}. Shape: {p.shape} | ID: {id(p)} | Requires Grad: {p.requires_grad}", flush=True)
+        # === DEBUG INJECTION END ===
         assert self.grad_reduce_handle is not None, (
             f"Communication call has not been issued for this bucket "
             f"({len(self.params_with_grad)}/{len(self.params)} params have grad available)"

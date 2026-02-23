@@ -49,7 +49,9 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
     args = get_args()
     config = core_transformer_config_from_args(args, config_class=DragonConfig)
     # TODO: this is pretty hacky, find a better way
-    if not is_first_or_last_pipeline_stage(vp_stage) and (
+    if (not is_first_or_last_pipeline_stage(vp_stage) 
+        and not (args.create_cu_seqlens_in_dataloader and args.pipeline_model_parallel_size > 1 and args.num_virtual_stages_per_pipeline_rank > 1)
+        and 
     (not mtp_on_this_rank(config, ignore_virtual=False, vp_stage=vp_stage))):
         return None, None, None, None, None, None, None
 
@@ -86,7 +88,6 @@ def loss_func(
             the data parallel ranks
     """
     args = get_args()
-
     if has_nvidia_modelopt and getattr(args, 'modelopt_enabled', False):  # [ModelOpt]
         return loss_func_modelopt(loss_mask, output_tensor, model=model)
 
@@ -240,6 +241,7 @@ def forward_step(data_iterator, model: DragonModel, return_schedule_plan: bool =
     with stimer(bdata=True):
         vp_stage = get_attr_wrapped_model(model, "vp_stage")
         tokens, labels, loss_mask, attention_mask, position_ids, cu_seqlens, max_seqlen = get_batch(data_iterator, vp_stage)
+        #print(f"PP rank : {parallel_state.get_pipeline_model_parallel_rank()} VPP rank : {parallel_state.get_virtual_pipeline_model_parallel_rank()} got batch with tokens shape {tokens.shape if tokens is not None else 'None'} and position_ids shape {position_ids.shape if position_ids is not None else 'None'} and cu_seqlens shape {cu_seqlens.shape if cu_seqlens is not None else 'None'} and max_seqlen {max_seqlen if max_seqlen is not None else 'None'}")
     timers('batch-generator').stop()
 
     #debug_batch(tokens, position_ids, cu_seqlens, max_seqlen)
@@ -287,6 +289,7 @@ def is_dataset_built_on_rank(vp_stage=None):
     return (
         is_first_or_last_pipeline_stage(vp_stage)
         or mtp_on_this_rank(config, ignore_virtual=False, vp_stage=vp_stage)
+        or (args.create_cu_seqlens_in_dataloader and args.pipeline_model_parallel_size > 1 and args.num_virtual_stages_per_pipeline_rank > 1)
     ) and parallel_state.get_tensor_model_parallel_rank() == 0
 
 

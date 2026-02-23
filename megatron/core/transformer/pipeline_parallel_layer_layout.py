@@ -162,6 +162,7 @@ class PipelineParallelLayerLayout:
 
         # Count layer numbers in this stage.
         num_layers_to_build = self.layout[pp_rank][vp_stage].count(layer_type)
+        print(f"Building {num_layers_to_build} on pp_rank {pp_rank}, vp_stage {vp_stage}")
         return num_layers_to_build
 
     def get_layer_offset(

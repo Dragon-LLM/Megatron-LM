@@ -269,6 +269,12 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         vp_stage: Optional[int] = None,
     ):
         super().__init__(config=config, vp_stage=vp_stage)
+        self.mlp_duration = 0.0
+        self.attention_duration = 0.0
+        self.nb_forward = 0
+        self.start_of_layer = torch.cuda.Event(enable_timing=True)
+        self.end_of_attention = torch.cuda.Event(enable_timing=True)
+        self.end_of_mlp = torch.cuda.Event(enable_timing=True)
 
         if pg_collection is None:
             pg_collection = ProcessGroupCollection.use_mpu_process_groups()
@@ -366,6 +372,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                     f"Unknown MLP type: {type(submodules.mlp)}. Using default kwargs.",
                 )
         self.mlp = build_module(submodules.mlp, config=self.config, **additional_mlp_kwargs)
+        print("mlp :", submodules.mlp)
         if hasattr(self.mlp, 'set_layer_number'):
             self.mlp.set_layer_number(self.layer_number)
 
@@ -452,8 +459,24 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         # this is only used to uniquely identify decode and non-decode cuda graph
         # runners in the cuda graph manager
         kwargs.pop("dynamic_inference_decode_only", None)
+        self.start_of_layer.record()
         hidden_states, context = self._forward_attention(*args, **kwargs)
+        self.end_of_attention.record()
         output = self._forward_mlp(hidden_states, kwargs.get("inference_context", None))
+        self.end_of_mlp.record()
+        torch.cuda.synchronize()
+        if self.nb_forward != 0:
+            self.attention_duration += self.start_of_layer.elapsed_time(self.end_of_attention)
+            self.mlp_duration += self.end_of_attention.elapsed_time(self.end_of_mlp)
+        self.nb_forward += 1
+        if self.nb_forward % 100 == 0:
+            log_single_rank(
+                logger,
+                logging.INFO,
+                f"Layer {self.layer_number} average attention time: "
+                f"{self.attention_duration / (self.nb_forward-1)} ms, "
+                f"average mlp time: {self.mlp_duration / (self.nb_forward-1)} ms",
+            )
         return output, context
 
     def _forward_attention(
@@ -671,6 +694,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             mlp_output_with_bias = (mlp_output, bias_output)
         else:
             mlp_output_with_bias = self.mlp(pre_mlp_layernorm_output)
+            
 
         if self.recompute_pre_mlp_layernorm:
             # discard the output of the pre-mlp layernorm and register the recompute
@@ -679,7 +703,8 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 mlp_output_with_bias[0]
             )
         nvtx_range_pop(suffix="mlp")
-
+        #print("MLP_output with bias len :", len(mlp_output_with_bias), "MLP_output_with_bias[0] shape :", mlp_output_with_bias[0].shape)
+        mlp_output_with_bias = (mlp_output_with_bias[0], mlp_output_with_bias[1])
         return self._forward_post_mlp(mlp_output_with_bias, residual)
 
     def _forward_post_mlp(self, mlp_output_with_bias, residual):

@@ -401,7 +401,7 @@ class GatedDeltaNet(MegatronModule):
 
         core_attn_out = core_attn_out.transpose(0, 1).contiguous()  # b s h d -> s b h d
 
-        return core_attn_out
+        return core_attn_out, 0
 
     @torch.compile
     def _torch_compiled_output_gate(self, x, gate):

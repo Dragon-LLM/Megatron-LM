@@ -784,7 +784,9 @@ class TEGroupedMLP(MegatronModule):
     ):
         super().__init__(config=config)
         self.num_local_experts = num_local_experts
-        self.input_size = self.config.moe_routed_input_dim or self.config.hidden_size
+        self.input_size = self.config.hidden_size
+        if hasattr(self.config, 'moe_routed_input_dim') and self.config.moe_routed_input_dim:
+            self.input_size = self.config.moe_routed_input_dim
         assert not (
             self.config.add_bias_linear and config.bias_dropout_fusion
         ), "bias_dropout_fusion is not supported in TEGroupedMLP when add_bias_linear=True"
@@ -943,7 +945,12 @@ class TEGroupedMLP(MegatronModule):
             if self.config.use_te_activation_func:
                 if bias_parallel is not None:
                     intermediate_parallel = intermediate_parallel + bias_parallel
-                intermediate_parallel = self.activation_func(intermediate_parallel)
+                # Guard against empty tensors which cause TE activation kernels
+                # to fail with quantize_fwd_helper assertion errors (quantize.cuh:55)
+                if intermediate_parallel.numel() == 0:
+                    intermediate_parallel = self.config.activation_func(intermediate_parallel)
+                else:
+                    intermediate_parallel = self.activation_func(intermediate_parallel)
                 if permuted_probs is not None:
                     original_dtype = intermediate_parallel.dtype
                     intermediate_parallel = intermediate_parallel * permuted_probs
@@ -1038,6 +1045,12 @@ class TEGroupedMLP(MegatronModule):
         singleton_local_shards = (metadata or {}).get('singleton_local_shards', False)
         sharded_state_dict = {}
         for name, module in self._modules.items():
+            # Skip activation_func (e.g. TE SReLU/SwiGLU ops) — it has no learnable
+            # parameters but carries _extra_state from TE FP8 bookkeeping.  Including
+            # it produces duplicate ShardedObject keys when expert parallelism is used
+            # because the same activation module is shared across all local experts.
+            if name == 'activation_func':
+                continue
             sub_sd = sharded_state_dict_default(module, f'{name}.', sharded_offsets, metadata)
             if name == 'linear_fc1' and self.config.gated_linear_unit:
                 num_global_experts = self.ep_group.size() * self.num_local_experts

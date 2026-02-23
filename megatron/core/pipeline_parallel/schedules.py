@@ -5,6 +5,7 @@ from functools import partial
 from typing import Callable, Iterator, List, Optional, Union
 
 import torch
+import torch.distributed as dist
 from torch.autograd.variable import Variable
 
 from megatron.core import parallel_state
@@ -639,6 +640,21 @@ def forward_backward_no_pipelining(
         if not forward_only:
             backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, config)
 
+    def _dump_missing_grads(models):
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        for mi, m in enumerate(models):
+            missing = []
+            for name, p in m.named_parameters():
+                if p.requires_grad and p.grad is None:
+                    missing.append(name)
+            if missing:
+                print(f"[rank {rank}] missing grads (model {mi}): {len(missing)}")
+                for n in missing[:200]:
+                    print(f"missing - {n}")
+
+    # ... in forward_backward_no_pipelining(), right before finalize:
+    #_dump_missing_grads([model] if not isinstance(model, (list, tuple)) else model)
+    
     if config.finalize_model_grads_func is not None and not forward_only:
         # Finalize model grads (perform full grad all-reduce / reduce-scatter for
         # data parallelism and layernorm all-reduce for sequence parallelism).
@@ -1005,7 +1021,7 @@ def forward_backward_pipelining_with_interleaving(
 
     model_type = get_model_type(model[0])
 
-    tensor_shape = [seq_length, micro_batch_size, config.hidden_size]
+    tensor_shape = [seq_length, micro_batch_size, config.hidden_size if not config.use_ddl else config.hidden_size * config.ddl_expand_factor]
     tensor_shape[0] = tensor_shape[0] // cp_group.size()
     if config.sequence_parallel:
         tensor_shape[0] = tensor_shape[0] // tp_group.size()
@@ -1951,7 +1967,7 @@ def get_tensor_shapes(
     if config.sequence_parallel:
         effective_seq_length = effective_seq_length // tp_group.size()
 
-    tensor_shapes.append((effective_seq_length, micro_batch_size, config.hidden_size))
+    tensor_shapes.append((effective_seq_length, micro_batch_size, config.hidden_size if not config.use_ddl else config.hidden_size * config.ddl_expand_factor))
     return tensor_shapes
 
 

@@ -558,6 +558,10 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
 
         return cu_seqlens, max_seqlen
 
+    # Initialize all potential return values to None to be safe
+    tokens, labels, loss_mask, attention_mask, position_ids = None, None, None, None, None
+    cu_seqlens, max_seqlen = None, None
+    
     if mpu.get_tensor_model_parallel_rank() == 0:
 
         assert data_iterator is not None
@@ -611,6 +615,12 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
             _broadcast(batch['labels'])
             _broadcast(batch['loss_mask'])
             _broadcast(batch['attention_mask'])
+            if args.create_cu_seqlens_in_dataloader:
+                batch['cu_seqlens'], batch['max_seqlen'] = _broadcast_cu_seqlens_and_max(
+                    batch['cu_seqlens'], batch['max_seqlen']
+                )
+        else :
+            # We are on intermediate PP/VPP stage so we just need to send cu_seqlens and max_seqlen to other TP groups
             if args.create_cu_seqlens_in_dataloader:
                 batch['cu_seqlens'], batch['max_seqlen'] = _broadcast_cu_seqlens_and_max(
                     batch['cu_seqlens'], batch['max_seqlen']
@@ -686,6 +696,12 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
                 cu_seqlens, max_seqlen = _broadcast_cu_seqlens_and_max(
                     cu_seqlens, max_seqlen
                 )
+        else:
+            # We are on intermediate PP/VPP stage so we just need to receive cu_seqlens and max_seqlen from TP0
+            if args.create_cu_seqlens_in_dataloader:
+                cu_seqlens, max_seqlen = _broadcast_cu_seqlens_and_max(
+                    cu_seqlens, max_seqlen
+                )
 
         batch = {
             'tokens': tokens,
@@ -696,7 +712,6 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
             'cu_seqlens': cu_seqlens,
             'max_seqlen': max_seqlen,
         }
-
     return batch
 
 

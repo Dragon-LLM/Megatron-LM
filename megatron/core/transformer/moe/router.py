@@ -519,7 +519,7 @@ class TopKRouter(Router):
         if self.routing_type == "sinkhorn":
             probs, routing_map = self.sinkhorn_load_balancing(logits)
         else:
-            probs, routing_map = topk_routing_with_score_function(
+            out = topk_routing_with_score_function(
                 logits,
                 self.topk,
                 use_pre_softmax=self.config.moe_router_pre_softmax,
@@ -530,6 +530,8 @@ class TopKRouter(Router):
                 expert_bias=self.expert_bias,
                 fused=self.config.moe_router_fusion,
             )
+            probs, routing_map = out[0], out[1]
+            top_indices = out[2] if len(out) > 2 else None
 
         # Apply token dropping to probs and routing_map.
         if self.config.moe_expert_capacity_factor is not None:
@@ -559,7 +561,7 @@ class TopKRouter(Router):
         # Optionally apply expert bias
         self._apply_expert_bias(routing_map)
 
-        return probs, routing_map
+        return probs, routing_map, top_indices
 
     def reset_global_aux_loss_tracker(self):
         """Reset the global aux loss tracker."""
@@ -584,9 +586,9 @@ class TopKRouter(Router):
             # Apply force load balancing with random logits for benchmark
             logits = apply_random_logits(logits)
 
-        probs, routing_map = self.routing(logits)
+        probs, routing_map, top_indices = self.routing(logits)
 
-        return probs, routing_map, stashed_hs
+        return probs, routing_map, top_indices, stashed_hs
 
     def _load_from_state_dict(self, *args, **kwargs):
         """Load the state dict of the router."""

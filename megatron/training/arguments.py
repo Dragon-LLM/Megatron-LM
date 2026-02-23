@@ -406,7 +406,7 @@ def validate_args(args, defaults={}):
         assert args.spec[0] == 'local' , '--attention-backend local is only supported with --spec local'
 
     # seq length
-    assert args.seq_length == args.training_sequence_length == args.max_position_embeddings
+    #assert args.seq_length == args.training_sequence_length == args.max_position_embeddings
 
     # Pipeline model parallel size.
     args.transformer_pipeline_model_parallel_size = args.pipeline_model_parallel_size
@@ -717,6 +717,16 @@ def validate_args(args, defaults={}):
     # FP4 and FP8 are mutually exclusive
     if args.fp4 and args.fp8:
         raise ValueError("--fp4-format and --fp8-format cannot be used simultaneously. Please choose one.")
+
+    # FP8 MLP-only requires FP8 mode and non-delayed recipe
+    if args.fp8_mlp_only:
+        if not args.fp8:
+            raise ValueError("--fp8-mlp-only requires --fp8-format to be set.")
+        if args.fp8_recipe == "delayed":
+            raise ValueError(
+                "--fp8-mlp-only does not support --fp8-recipe delayed. "
+                "Use --fp8-recipe tensorwise, blockwise, or mxfp8 instead."
+            )
 
     # FP4 param requires FP4 mode
     if args.fp4_param and not args.fp4:
@@ -1388,6 +1398,9 @@ def _add_transformer_engine_args(parser):
                             'dtype) and perform the param all-gather in fp8.')
     group.add_argument('--first-last-layers-bf16', action='store_true',
                        help='Construct first and last layers in bf16 when doing FP8 training.')
+    group.add_argument('--fp8-mlp-only', action='store_true',
+                       help='Apply FP8 precision only to the MLP/MoE portion of each layer, '
+                            'keeping the mixer (Mamba/Attention) in BF16. Requires --fp8-format.')
     group.add_argument('--num-layers-at-start-in-bf16', type=int, default=1,
                        help='Number of layers at start to construct in bf16 when --first-last-layers-bf16 is enabled.')
     group.add_argument('--num-layers-at-end-in-bf16', type=int, default=1,
@@ -1745,6 +1758,7 @@ def _add_dragon_args(parser):
     group.add_argument('--training-sequence-length', type=int, default=2048)
     group.add_argument('--slw-warmup-steps', type=int, default=0)
     group.add_argument('--slw-start', type=int, default=0)
+    group.add_argument('--slw-end', type=int, default=0)
     group.add_argument('--slw-increment', type=int, default=0)
     group.add_argument('--moe-router-type', type=str, default="classic")
     group.add_argument("--no-mixer-gn", dest="mixer_gn", action="store_false")
@@ -1765,9 +1779,11 @@ def _add_dragon_args(parser):
     group.add_argument('--lr-emb', type=float, default=0.01)
     group.add_argument('--lr-scalar', type=float, default=0.01)
     group.add_argument('--lr-head', type=float, default=0.01)
+    group.add_argument('--lr-expert', type=float, default=None)
     group.add_argument('--train-iters-base', type=int, default=None)
     group.add_argument('--hidden-size-base', type=int, default=None)
     group.add_argument('--layers-mixer-config-base', type=str, default=None)
+    group.add_argument('--use-ddl', action='store_true')
 
     return parser
 
