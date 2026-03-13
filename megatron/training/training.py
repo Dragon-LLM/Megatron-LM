@@ -1627,6 +1627,7 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
             hasattr(args, 'curr_iteration') and \
             args.curr_iteration % args.log_interval == 0:
         per_param_grad_norms = {}
+        per_param_grad_to_param_ratio = {}
         for chunk_idx, model_chunk in enumerate(model):
             prefix = f"chunk{chunk_idx}/" if len(model) > 1 else ""
             for name, param in model_chunk.named_parameters():
@@ -1636,12 +1637,18 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
                 if grad is not None:
                     # Remove torch.compile wrapper prefixes (e.g. "_orig_mod.")
                     clean_name = name.replace("_orig_mod.", "")
-                    per_param_grad_norms[prefix + clean_name] = torch.norm(
-                        grad.detach().float(), 2.0
-                    ).item()
+                    key = prefix + clean_name
+                    grad_norm = torch.norm(grad.detach().float(), 2.0).item()
+                    param_norm = torch.norm(param.detach().float(), 2.0).item()
+                    per_param_grad_norms[key] = grad_norm
+                    per_param_grad_to_param_ratio[key] = (
+                        grad_norm / param_norm if param_norm > 0 else float('inf')
+                    )
         args._per_param_grad_norms = per_param_grad_norms
+        args._per_param_grad_to_param_ratio = per_param_grad_to_param_ratio
     else:
         args._per_param_grad_norms = None
+        args._per_param_grad_to_param_ratio = None
 
     # Update parameters.
 
@@ -1879,11 +1886,15 @@ def training_log(
             if wandb_writer:
                 wandb_writer.log({'grad-norm': grad_norm}, iteration)
         if wandb_writer and getattr(args, '_per_param_grad_norms', None):
-            wandb_writer.log(
-                {f'grad-norm-per-param/{k}': v
-                 for k, v in args._per_param_grad_norms.items()},
-                iteration,
-            )
+            per_param_metrics = {
+                f'grad-norm-per-param/{k}': v
+                for k, v in args._per_param_grad_norms.items()
+            }
+            per_param_metrics.update({
+                f'grad-norm-over-param-norm/{k}': v
+                for k, v in args._per_param_grad_to_param_ratio.items()
+            })
+            wandb_writer.log(per_param_metrics, iteration)
         if num_zeros_in_grad is not None:
             writer.add_scalar('num-zeros', num_zeros_in_grad, iteration)
             writer.add_scalar(
