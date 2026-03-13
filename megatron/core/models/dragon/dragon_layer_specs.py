@@ -91,7 +91,7 @@ def get_dragon_block_spec(
         module=SelfDiffAttention,
         params={"attn_mask_type": AttnMaskType.causal if not config.intra_doc_masking else AttnMaskType.padding_causal},
         submodules=SelfDiffAttentionSubmodules(
-            linear_in=TELayerNormColumnParallelLinear,
+            linear_in=TELayerNormColumnParallelLinear if not config.use_geodesic_norm else TEColumnParallelLinear,
             linear_BkBv=TELinear,
             core_attention=TEDotProductAttention,
             q_layernorm=TENorm,
@@ -102,7 +102,7 @@ def get_dragon_block_spec(
         module=SelfDiffAttentionV2,
         params={"attn_mask_type": AttnMaskType.causal if not config.intra_doc_masking else AttnMaskType.padding_causal},
         submodules=SelfDiffAttentionV2Submodules(
-            linear_in=TELayerNormColumnParallelLinear,
+            linear_in=TELayerNormColumnParallelLinear if not config.use_geodesic_norm else TEColumnParallelLinear,
             linear_BkBv=TELinear,
             core_attention=TEDotProductAttention,
             q_layernorm=TENorm,
@@ -118,11 +118,11 @@ def get_dragon_block_spec(
     mamba3 = ModuleSpec(
         module=FastMamba3, #if config.tensor_model_parallel_size == 1 else TPFastMamba3,
         submodules=Mamba3Submodules(
-            in_proj=TELayerNormColumnParallelLinear,
+            in_proj=TELayerNormColumnParallelLinear if not config.use_geodesic_norm else TEColumnParallelLinear,
             b_norm=TENorm,
             c_norm=TENorm,
             rope_proj=TELinear,
-            output_norm=TENorm if config.mamba3_fast else IdentityOp,
+            output_norm=TENorm if not config.use_geodesic_norm else IdentityOp,
             dyn_proj=TELinear if config.mamba3_fast else IdentityOp,
         ),
     )
@@ -175,9 +175,9 @@ def get_dragon_block_spec(
             attention_v2=attention_v2,
             gdn=gdn,
             mamba3=mamba3,
-            mixer_norm=TENorm,
+            mixer_norm=TENorm if not config.use_geodesic_norm else IdentityOp,
             mixer_proj=TERowParallelLinear,
-            pre_mlp_norm=TENorm,
+            pre_mlp_norm=TENorm if not config.use_geodesic_norm else IdentityOp,
             mlp=mlp,
             moe=moe,
         ),

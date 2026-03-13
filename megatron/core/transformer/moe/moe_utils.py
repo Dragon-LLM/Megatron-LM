@@ -930,6 +930,53 @@ def get_updated_expert_bias(tokens_per_expert, expert_bias, expert_bias_update_r
         return updated_expert_bias
 
 
+def get_updated_expert_bias_pid(
+    tokens_per_expert, expert_bias, error_integral, prev_error, kp, ki, kd, integral_max=10.0
+):
+    """Update expert bias using a PID controller for smoother load balancing.
+
+    Instead of a sign-based step, uses proportional-integral-derivative control
+    on the normalized error (average_tokens - tokens_per_expert) / average_tokens.
+
+    Args:
+        tokens_per_expert (torch.Tensor): Shape [num_layers, num_experts].
+        expert_bias (torch.Tensor): Shape [num_layers, num_experts].
+        error_integral (torch.Tensor): Accumulated integral of error, same shape.
+        prev_error (torch.Tensor): Error from previous step, same shape.
+        kp (float): Proportional gain.
+        ki (float): Integral gain.
+        kd (float): Derivative gain.
+        integral_max (float): Clamp magnitude for the integral term to prevent windup.
+
+    Returns:
+        Tuple of (updated_expert_bias, updated_error_integral, current_error).
+    """
+    with torch.no_grad():
+        # All Reduce Across TPxCPxDP group
+        torch.distributed.all_reduce(
+            tokens_per_expert,
+            group=parallel_state.get_tensor_and_data_parallel_group(with_context_parallel=True),
+        )
+        average_tokens = tokens_per_expert.sum(dim=-1, keepdim=True) / tokens_per_expert.shape[-1]
+
+        # Normalized error: positive means expert is underloaded
+        error = (average_tokens - tokens_per_expert) / average_tokens.clamp(min=1.0)
+
+        # Integral with anti-windup clamping
+        new_integral = (error_integral + error).clamp(-integral_max, integral_max)
+
+        # On cold start (prev_error is all zeros), suppress the derivative kick
+        # by treating the current error as the baseline.
+        cold_start = (prev_error.abs().sum() == 0)
+        derivative = error - prev_error if not cold_start else torch.zeros_like(error)
+
+        # PID output
+        pid_output = kp * error + ki * new_integral + kd * derivative
+        updated_expert_bias = expert_bias + pid_output
+
+        return updated_expert_bias, new_integral, error
+
+
 def maybe_move_tensor_to_cpu(tensor, as_numpy=False, record_stream=False):
     """Move a tensor to CPU if it is on GPU.
     Args:

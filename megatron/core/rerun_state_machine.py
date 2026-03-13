@@ -908,6 +908,11 @@ class RerunStateMachine:
     def _restore_state(self) -> None:
         """Internal method that restores the state that was saved in _save_state()."""
 
+        if self.saved_state is None:
+            logger.warning("RerunStateMachine: saved_state is None, skipping state restoration "
+                           "(likely resuming from checkpoint).")
+            return
+
         rng_state = self.saved_state["rng_state"]
         random.setstate(rng_state["random_rng_state"])
         np.random.set_state(rng_state["np_rng_state"])

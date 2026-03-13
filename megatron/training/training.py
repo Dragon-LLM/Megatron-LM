@@ -2101,6 +2101,10 @@ def save_checkpoint_and_time(
 
     # Log E2E metrics before save-checkpoint
     one_logger_utils.track_e2e_metrics()
+    # Force garbage collection and clear CUDA cache before checkpointing
+    # to reclaim memory from eval / training temporaries and avoid OOM during save.
+    gc.collect()
+    torch.cuda.empty_cache()
     if should_disable_forward_pre_hook(args):
         disable_forward_pre_hook(model)
     save_checkpoint(

@@ -65,6 +65,7 @@ class OptimizerParamScheduler:
         slw_start: int = 0,
         slw_end: int = 0,
         slw_increment: int = 0,
+        complete_slw: bool = False,
         global_batch_size: int = 0,
         optim: str = 'adam',
         beta1: Optional[float] = None,
@@ -114,6 +115,7 @@ class OptimizerParamScheduler:
         self.slw_start = slw_start
         self.slw_end = slw_end
         self.slw_increment = slw_increment
+        self.complete_slw = complete_slw
         self.global_batch_size = global_batch_size
 
         self.ademamix = (optim == 'ademamix')
@@ -232,8 +234,21 @@ class OptimizerParamScheduler:
             return self.slw_end
         progress_ratio = (self.num_steps / self.global_batch_size) / self.slw_warmup_steps
         window = self.slw_start + progress_ratio * (self.slw_end - self.slw_start) # linear scheduling
-        window = self.slw_increment * math.ceil(window / self.slw_increment) # quantize
-        window = int(min(window, self.slw_end)) # cap
+
+        
+        
+        if not self.complete_slw:
+            window = self.slw_increment * math.ceil(window / self.slw_increment) # quantize
+            window = int(min(window, self.slw_end)) # cap
+        else:
+            # find divisors so that we can divide the sequence length, in mini_batches
+            valid_divisors = [d for d in range(1, self.slw_end + 1) 
+                            if self.slw_end % d == 0 and d >= self.slw_start]
+            if not valid_divisors:
+                valid_divisors = [self.slw_end]
+            # Round to the NEAREST divisor
+            window = int(min(valid_divisors, key=lambda d: abs(d - window)))
+
         return window
     
     def get_beta3(self) -> float:
@@ -273,6 +288,11 @@ class OptimizerParamScheduler:
                         1 - (1 - self.beta2) * self.rhosq_adjusted,
                         1 - (1 - self.get_beta3()) * self.rhosq_adjusted
                     )
+                    #param_group['betas'] = (
+                    #    self.beta1,
+                    #    self.beta2,
+                    #    self.get_beta3()
+                    #)
                 else:
                     param_group['betas'] = (
                         1 - (1 - self.beta1) * self.rhosq_adjusted,

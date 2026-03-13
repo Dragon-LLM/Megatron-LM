@@ -52,6 +52,19 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
     object_storage_cache_path: Optional[str] = None
     """Path for caching indices for s3 or msc dataloading."""
 
+    mask_repeated_ngrams: bool = True
+    """Option to mask the loss for tokens that belong to highly-repeated n-grams
+    (following OLMo-style training stabilization). When enabled, any token position
+    that is part of an n-gram repeated at least `mask_repeated_ngrams_min_repeats`
+    consecutive times will have its loss masked to 0.
+    """
+
+    mask_repeated_ngrams_max_n: int = 13
+    """Maximum n-gram size to check for repetitions (1 to max_n inclusive)."""
+
+    mask_repeated_ngrams_min_repeats: int = 32
+    """Minimum number of consecutive repetitions of an n-gram to trigger masking."""
+
     def __post_init__(self) -> None:
         """Do asserts and set fields post init"""
         super().__post_init__()
@@ -207,6 +220,17 @@ class GPTDataset(MegatronDataset):
 
         # For padded sequences, mask the loss
         loss_mask[labels == self._pad_token_id] = 0.0
+
+        # Mask loss for tokens that belong to highly-repeated n-grams (OLMo-style stabilization).
+        # Tokens in degenerate repetitive spans are zeroed out so the model does not learn
+        # from them, preventing loss spikes caused by near-infinite-entropy sequences.
+        if self.config.mask_repeated_ngrams:
+            ngram_mask = _get_repeated_ngram_loss_mask(
+                labels.numpy(),
+                max_n=self.config.mask_repeated_ngrams_max_n,
+                min_repeats=self.config.mask_repeated_ngrams_min_repeats,
+            )
+            loss_mask[torch.from_numpy(ngram_mask)] = 0.0
 
         # For padded sequences, ensure the embedding layer can map the token ID
         tokens[tokens == self._pad_token_id] = 0
@@ -569,10 +593,11 @@ def _build_document_index(
     """
 
     if not separate_final_epoch or num_epochs == 1:
-        document_index = numpy.mgrid[0:num_epochs, 0 : len(documents)][1]
-        document_index[:] = documents
-        document_index = document_index.reshape(-1)
-        document_index = document_index.astype(numpy.int32)
+        # Use tile instead of mgrid to avoid a ~297 GB int64 intermediate allocation.
+        # mgrid[0:N, 0:M] creates two (N,M) int64 arrays; tile directly produces int32.
+        document_index = numpy.tile(
+            numpy.asarray(documents, dtype=numpy.int32), num_epochs
+        )
         numpy_random_state.shuffle(document_index)
         return document_index
 
@@ -611,6 +636,79 @@ def _build_shuffle_index(
     numpy_random_state.shuffle(shuffle_idx_last)
 
     return numpy.concatenate((shuffle_idx_first, shuffle_idx_last))
+
+
+def _get_repeated_ngram_loss_mask(
+    tokens: numpy.ndarray, max_n: int = 13, min_repeats: int = 32
+) -> numpy.ndarray:
+    """Return a boolean mask (True = should be masked) for tokens in highly-repeated n-grams.
+
+    For each n in [1, max_n], we find positions where the same n-gram is repeated at least
+    `min_repeats` consecutive times. All token positions covered by such a run are marked True.
+
+    Follows the OLMo approach for training stabilization: mask the loss on degenerate
+    repetitive sequences that can cause loss spikes.
+
+    Args:
+        tokens (numpy.ndarray): 1-D int array of token ids (the *input* tokens, i.e. labels).
+        max_n (int): Maximum n-gram size to check (inclusive).
+        min_repeats (int): Minimum number of consecutive repetitions to trigger masking.
+
+    Returns:
+        numpy.ndarray: Boolean array of same length as tokens.  True = mask this position's loss.
+    """
+    L = len(tokens)
+    mask = numpy.zeros(L, dtype=numpy.bool_)
+
+    for n in range(1, max_n + 1):
+        total_span = n * min_repeats
+        if total_span > L:
+            continue
+
+        if n == 1:
+            # Special fast path for unigrams: find runs of identical tokens
+            eq = numpy.equal(tokens[:-1], tokens[1:])  # length L-1
+            if not numpy.any(eq):
+                continue
+            # Pad to find run boundaries
+            padded = numpy.concatenate(([False], eq, [False]))
+            diffs = numpy.diff(padded.astype(numpy.int8))
+            starts = numpy.where(diffs == 1)[0]
+            ends = numpy.where(diffs == -1)[0]
+            run_lengths = ends - starts  # number of *equalities*, actual run = +1
+            for s, rl in zip(starts, run_lengths):
+                actual_run = rl + 1  # number of identical tokens in this run
+                if actual_run >= min_repeats:
+                    mask[s : s + actual_run] = True
+        else:
+            # For n-grams of size n: tokens[i:i+n] == tokens[i+n:i+2n] means positions
+            # i..i+n-1 repeat.  We check if tokens[j] == tokens[j+n] for all j in a window.
+            eq_shift = numpy.equal(tokens[:-n], tokens[n:]).astype(numpy.int8)  # length L-n
+            needed = (min_repeats - 1) * n  # number of consecutive True's required
+
+            if len(eq_shift) < needed:
+                continue
+
+            # Sliding window sum via cumsum
+            cs = numpy.cumsum(eq_shift)
+            window_sum = numpy.empty(len(eq_shift) - needed + 1, dtype=numpy.int64)
+            window_sum[0] = cs[needed - 1]
+            window_sum[1:] = cs[needed:] - cs[: len(cs) - needed]
+
+            # Positions where the full window matches
+            match_positions = numpy.where(window_sum == needed)[0]
+            if len(match_positions) == 0:
+                continue
+
+            # Greedily mark non-overlapping spans
+            prev = -total_span
+            for pos in match_positions:
+                if pos >= prev + total_span:
+                    # This span covers tokens[pos : pos + total_span]
+                    mask[pos : pos + total_span] = True
+                    prev = pos
+
+    return mask
 
 
 def _get_ltor_masks_and_position_ids(

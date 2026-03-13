@@ -196,6 +196,29 @@ class TopKRouter(Router):
                     device=torch.cuda.current_device(),
                 ),
             )
+            # PID controller state buffers (non-persistent: they start from zero on
+            # restart, which is fine — the controller converges quickly. Making them
+            # non-persistent avoids checkpoint compatibility issues when switching
+            # mid-training from sign-based bias to PID.)
+            if getattr(self.config, 'moe_router_bias_use_pid', False):
+                self.register_buffer(
+                    'pid_error_integral',
+                    torch.zeros(
+                        self.config.num_moe_experts,
+                        dtype=torch.float32,
+                        device=torch.cuda.current_device(),
+                    ),
+                    persistent=False,
+                )
+                self.register_buffer(
+                    'pid_prev_error',
+                    torch.zeros(
+                        self.config.num_moe_experts,
+                        dtype=torch.float32,
+                        device=torch.cuda.current_device(),
+                    ),
+                    persistent=False,
+                )
         else:
             self.local_tokens_per_expert = None
             self.expert_bias = None
@@ -230,6 +253,12 @@ class TopKRouter(Router):
         if hasattr(self, 'expert_bias') and self.expert_bias is not None:
             if self.expert_bias.dtype != torch.float32:
                 self.expert_bias.data = self.expert_bias.data.to(torch.float32)
+        if hasattr(self, 'pid_error_integral') and self.pid_error_integral is not None:
+            if self.pid_error_integral.dtype != torch.float32:
+                self.pid_error_integral.data = self.pid_error_integral.data.to(torch.float32)
+        if hasattr(self, 'pid_prev_error') and self.pid_prev_error is not None:
+            if self.pid_prev_error.dtype != torch.float32:
+                self.pid_prev_error.data = self.pid_prev_error.data.to(torch.float32)
 
     def sinkhorn_load_balancing(self, logits: torch.Tensor):
         """Apply sinkhorn routing to the logits tensor.

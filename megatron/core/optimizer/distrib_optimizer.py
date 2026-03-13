@@ -758,9 +758,35 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         state_dict_param_groups = []
         for inner_param_group in inner_state_dict["param_groups"]:
             needed_groups = make_needed_groups(inner_param_group)
-            state_dict_param_groups.append(
-                {**param_groups_map[needed_groups], "params": inner_param_group['params']}
-            )
+            #state_dict_param_groups.append(
+            #    {**param_groups_map[needed_groups], "params": inner_param_group['params']}
+            #)
+
+            if needed_groups in param_groups_map:
+                state_dict_param_groups.append(
+                    {**param_groups_map[needed_groups], "params": inner_param_group['params']}
+                )
+            else:
+                # Param group keys (wd_mult, lr_mult, ...) changed due to LR update.
+                # Fall back to positional (order-based) matching.
+                print(
+                    f"[WARNING] Param group key mismatch during checkpoint load. "
+                    f"Key {needed_groups} not found in checkpoint. "
+                    f"Falling back to order-based param group matching."
+                )
+                ckpt_param_groups = state_dict["optimizer"]["param_groups"]
+                inner_param_groups = inner_state_dict["param_groups"]
+                assert len(ckpt_param_groups) == len(inner_param_groups), (
+                    f"Cannot fall back to order-based matching: checkpoint has "
+                    f"{len(ckpt_param_groups)} param groups but current optimizer "
+                    f"has {len(inner_param_groups)}."
+                )
+                state_dict_param_groups = []
+                for ckpt_pg, inner_pg in zip(ckpt_param_groups, inner_param_groups):
+                    state_dict_param_groups.append(
+                        {**ckpt_pg, "params": inner_pg['params']}
+                    )
+                break
 
         # Allocate or retrieve optimizer state (i.e., tensors).
         if len(self.optimizer.state) == 0:
@@ -1470,7 +1496,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 for model_param, (
                     param_world_start,
                     param_world_end,
-                    _,
+                    bucket_id,
                 ) in buffer.param_index_map.items():
                     try:
                         sharded_metadata = param_to_sharded_metadata[model_param]
@@ -1483,6 +1509,17 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         sharded_metadata.flattened_range is None
                     ), f"Flattened model tensor not supported ({sharded_metadata})"
 
+                    per_bucket_numel = self.per_bucket_numel[gbuf_idx][dtype]
+                    per_bucket_numel_unpadded = self.per_bucket_numel_unpadded[gbuf_idx][dtype]
+
+                    prior_bucket_padding = sum(
+                        per_bucket_numel[i] - per_bucket_numel_unpadded[i]
+                        for i in range(bucket_id)
+                    )
+
+                    packed_world_start = param_world_start - prior_bucket_padding
+                    packed_world_end = param_world_end - prior_bucket_padding
+
                     # Note: replica_id is exactly the same as in the model param
                     replica_id = sharded_metadata.replica_id
 
@@ -1493,8 +1530,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                             # specifically and is read from param_groups.
                             # Numel unpadded is not needed.
                             continue
-                        state_ten = world_tensors[state_key][param_world_start:param_world_end]
-                        missing_elems_num = (param_world_end - param_world_start) - len(state_ten)
+
+                        state_ten = world_tensors[state_key][packed_world_start:packed_world_end]
+                        missing_elems_num = (packed_world_end - packed_world_start) - len(state_ten)
 
                         if missing_elems_num > 0:
                             # `state_ten` is shorter than the slice which means the world_tensor
@@ -1504,10 +1542,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                             assert param_world_end > buffer.numel_unpadded
 
                             logger.warning(
-                                f"'{sharded_metadata.key}' param range exceeds"
-                                f" unpadded buffer by {missing_elems_num} elements."
-                                f" It will be padded with zeros which can lead to"
-                                f" data corruption."
+                                f"'{sharded_metadata.key}' packed param range exceeds packed optimizer buffer "
+                                f"by {missing_elems_num} elements after bucket-padding adjustment. "
+                                f"This should not happen."
                             )
                             state_ten = torch.nn.functional.pad(state_ten, (0, missing_elems_num))
 

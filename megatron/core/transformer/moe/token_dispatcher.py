@@ -849,7 +849,10 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         )
 
         # Reshape the output tensor
-        output = output.view(self.hidden_shape)
+        if output.numel() == 0:
+            output = output.new_zeros(self.hidden_shape)
+        else:
+            output = output.view(self.hidden_shape)
 
         # Add shared experts output
         if self.shared_experts is not None:

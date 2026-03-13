@@ -21,7 +21,7 @@ from megatron.core.pipeline_parallel.utils import (
 from megatron.core.process_groups_config import ProcessGroupCollection
 
 from .. import parallel_state
-from ..transformer.moe.moe_utils import get_updated_expert_bias
+from ..transformer.moe.moe_utils import get_updated_expert_bias, get_updated_expert_bias_pid
 from ..transformer.transformer_config import TransformerConfig
 from ..utils import (
     get_attr_wrapped_model,
@@ -293,27 +293,58 @@ def reset_model_temporary_tensors(config: TransformerConfig, model: List[torch.n
 def _update_router_expert_bias(model: List[torch.nn.Module], config: TransformerConfig):
     """
     Update the expert bias of the router for a global batch.
-    This requires all-reduce of local_tokens_per_expert across TPxCPxDP ranks
+    This requires all-reduce of local_tokens_per_expert across TPxCPxDP ranks.
+    Supports both sign-based (default) and PID controller modes.
     """
     tokens_per_expert_list = []
     expert_bias_list = []
+    router_modules = []
     for model_chunk in model:
         for module in get_attr_wrapped_model(model_chunk, 'modules')():
             if hasattr(module, 'expert_bias'):
                 module.local_tokens_per_expert2 = module.local_tokens_per_expert.clone()
                 tokens_per_expert_list.append(module.local_tokens_per_expert)
                 expert_bias_list.append(module.expert_bias)
+                router_modules.append(module)
     # For hybrid models with both MoE and Dense layers, this list can be empty.
     if len(expert_bias_list) == 0:
         return
     stacked_tokens_per_expert = torch.stack(tokens_per_expert_list, dim=0)
     stacked_expert_bias = torch.stack(expert_bias_list, dim=0)
-    stacked_updated_expert_bias = get_updated_expert_bias(
-        stacked_tokens_per_expert, stacked_expert_bias, config.moe_router_bias_update_rate
-    )
 
-    for expert_bias, updated_expert_bias in zip(expert_bias_list, stacked_updated_expert_bias):
-        expert_bias.copy_(updated_expert_bias)
+    use_pid = getattr(config, 'moe_router_bias_use_pid', False)
+    if use_pid:
+        error_integral_list = [m.pid_error_integral for m in router_modules]
+        prev_error_list = [m.pid_prev_error for m in router_modules]
+        stacked_integral = torch.stack(error_integral_list, dim=0)
+        stacked_prev_error = torch.stack(prev_error_list, dim=0)
+
+        stacked_updated_bias, stacked_new_integral, stacked_new_error = (
+            get_updated_expert_bias_pid(
+                stacked_tokens_per_expert,
+                stacked_expert_bias,
+                stacked_integral,
+                stacked_prev_error,
+                kp=config.moe_router_bias_pid_kp,
+                ki=config.moe_router_bias_pid_ki,
+                kd=config.moe_router_bias_pid_kd,
+            )
+        )
+
+        for module, upd_bias, new_integral, new_error in zip(
+            router_modules, stacked_updated_bias, stacked_new_integral, stacked_new_error
+        ):
+            module.expert_bias.copy_(upd_bias)
+            module.pid_error_integral.copy_(new_integral)
+            module.pid_prev_error.copy_(new_error)
+    else:
+        stacked_updated_expert_bias = get_updated_expert_bias(
+            stacked_tokens_per_expert, stacked_expert_bias, config.moe_router_bias_update_rate
+        )
+        for expert_bias, updated_expert_bias in zip(
+            expert_bias_list, stacked_updated_expert_bias
+        ):
+            expert_bias.copy_(updated_expert_bias)
 
 
 def _allreduce_non_tensor_model_parallel_grads(

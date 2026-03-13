@@ -138,6 +138,8 @@ class DragonConfig(ModelParallelConfig):
     
     use_ddl: bool = False
     
+    use_geodesic_norm: bool = False
+    
     ddl_expand_factor: int = 4
 
     attention_backend: AttnBackend = AttnBackend.auto
@@ -217,6 +219,9 @@ class DragonConfig(ModelParallelConfig):
     window_size: Optional[Tuple[int, int]] = None
     """If not None, then will use sliding window attention. The size of the window is specified by
     the numbers inside the tuple; -1 is special value meaning "infinite window size"."""
+
+    complete_slw: bool = False
+    """Whether to use window size on all mixer layers"""
 
     window_attn_skip_freq: Optional[Union[int, List[int]]] = None
     """Frequency of full attention layers among sliding window attention layers. Accepts either:
@@ -591,6 +596,18 @@ class DragonConfig(ModelParallelConfig):
     in a global batch, where the bias is increased for the experts with less assigned tokens
     and decreased for the experts with more assigned tokens.
     The default value 1e-3 is same as that used in DeepSeekV3."""
+
+    moe_router_bias_use_pid: bool = False
+    """Use a PID controller instead of the sign-based step for expert bias updates."""
+
+    moe_router_bias_pid_kp: float = 1e-3
+    """Proportional gain for the PID expert bias controller."""
+
+    moe_router_bias_pid_ki: float = 1e-4
+    """Integral gain for the PID expert bias controller."""
+
+    moe_router_bias_pid_kd: float = 1e-4
+    """Derivative gain for the PID expert bias controller."""
 
     moe_router_force_load_balancing: bool = False
     """[Experimental] Force load balancing with random logits for MoE router, supports naive topk 

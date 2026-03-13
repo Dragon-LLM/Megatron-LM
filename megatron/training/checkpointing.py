@@ -1498,14 +1498,14 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
                                                         if getattr(state_dict_args, 'ckpt_fully_parallel_save', False)
                                                         else 'dp_zero_gather_scatter'),
                     }
-                if (
-                    ckpt_tp_pp != run_tp_pp
-                    and sharded_sd_metadata['distrib_optim_sharding_type']
-                    not in DistributedOptimizer.checkpoint_fully_reshardable_formats
-                ):
-                    raise RuntimeError(f"{mismatch_msg}: not supported for DistributedOptimizer with sharding type"
-                                       f" {sharded_sd_metadata['distrib_optim_sharding_type']}."
-                                       f" Please use `--ckpt-fully-parallel-save` flag during checkpoint saving.")
+                #if (
+                #    ckpt_tp_pp != run_tp_pp
+                #    and sharded_sd_metadata['distrib_optim_sharding_type']
+                #    not in DistributedOptimizer.checkpoint_fully_reshardable_formats
+                #):
+                #    raise RuntimeError(f"{mismatch_msg}: not supported for DistributedOptimizer with sharding type"
+                #                       f" {sharded_sd_metadata['distrib_optim_sharding_type']}."
+                #                       f" Please use `--ckpt-fully-parallel-save` flag during checkpoint saving.")
 
                 # Check if fully parallel load is compatible with sharding type
                 if args.ckpt_fully_parallel_load and sharded_sd_metadata['distrib_optim_sharding_type'] == 'dp_zero_gather_scatter':
@@ -1668,7 +1668,7 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
             if strict:
                 # Fallback support for backward compatibility breaking changes in TransformerEngine
                 load_return = module.load_state_dict(state_dict, strict=False)
-                print(f"load_return: {load_return}")
+                #print(f"load_return: {load_return}")
     # Model.
     strict = False if args.retro_add_retriever else strict
     if not skip_load_to_model_and_opt:

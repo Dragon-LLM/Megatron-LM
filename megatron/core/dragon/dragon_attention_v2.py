@@ -795,6 +795,47 @@ class DiffAttentionV2(MegatronModule, ABC):
         nvtx_range_pop(suffix="qkv")
 
         # =====================
+        # complete slw
+        # =====================
+        if self.config.complete_slw:
+            assert packed_seq_params is not None, "Packed sequence parameters must be provided for complete SLW."
+            assert window_size is not None, "Window size must be provided for complete SLW."
+            
+            nvtx_range_push(suffix="complete_slw")
+            b, L = query.size(0), query.size(1)
+            
+            wsize = window_size[0] if window_size is not None else 0
+            window_boundaries = torch.arange(0, L + wsize, wsize, device=query.device, dtype=torch.int32)
+            window_boundaries = torch.unique(torch.clamp(window_boundaries, max=L))
+            # case where intra doc masking is off, but we don't want to plan this for now
+            #if cu_seqlens is None or max_seqlen is None:
+            #    max_seqlen = wsize
+            #    cu_seqlens = window_boundaries 
+            #    boundaries_1d = window_boundaries
+            #else: 
+            combined = torch.cat([window_boundaries, packed_seq_params.cu_seqlens_q])
+            # torch.unique automatically removes duplicates and sorts them in ascending order
+            packed_seq_params.cu_seqlens_q = torch.unique(combined, sorted=True)
+            packed_seq_params.cu_seqlens_kv = packed_seq_params.cu_seqlens_q
+            packed_seq_params.max_seqlen_q = min(packed_seq_params.max_seqlen_q, wsize) if wsize > 0 else packed_seq_params.max_seqlen_q
+            packed_seq_params.max_seqlen_kv = packed_seq_params.max_seqlen_q
+            boundaries_1d = packed_seq_params.cu_seqlens_q
+
+            # 3. Update position_ids based on the new boundaries
+            seq_range = torch.arange(L, device=query.device)
+            
+            # Find which chunk index each token belongs to
+            chunk_indices = torch.searchsorted(boundaries_1d, seq_range, right=True) - 1
+            chunk_starts = boundaries_1d[chunk_indices]
+            
+            # Calculate position IDs and expand to batch size
+            # position_ids usually still needs to be (b, L) for embedding layers
+            packed_seq_params.position_ids = (seq_range - chunk_starts).unsqueeze(0).expand(b, -1)
+
+
+            nvtx_range_pop(suffix="complete_slw")
+
+        # =====================
         # kv shift
         # =====================
         if self.config.token_shift:
@@ -1138,6 +1179,17 @@ class SelfDiffAttentionV2(DiffAttentionV2):
         self.num_super_heads_per_partition = self.num_super_heads // self.pg_collection.tp.size()
         self.super_head_dim = 4 * Dk + 1 * (r + alpha_dim + r + alpha_dim + 1) + 3 * (gate_dim)
         out_dim = self.num_super_heads * self.super_head_dim
+        if not self.config.use_geodesic_norm:
+            args = {
+                "return_layernorm_output": True,
+                "alpha_fwd": input_scalar,
+                "alpha_bwd": input_scalar,
+            }
+        else :
+            args = {
+                "alpha_fwd": input_scalar,
+                "alpha_bwd": input_scalar,
+            }
         self.linear_in = build_module(
             submodules.linear_in,
             self.config.hidden_size,
@@ -1146,15 +1198,17 @@ class SelfDiffAttentionV2(DiffAttentionV2):
             init_method=self.config.init_method,
             gather_output=False,
             bias=self.config.add_bias_linear or self.config.add_qkv_bias,
-            return_layernorm_output=True,
             skip_bias_add=False,
             is_expert=False,
             tp_comm_buffer_name='in',
             tp_group=self.pg_collection.tp,
-            alpha_fwd=input_scalar,
-            alpha_bwd=input_scalar,
+            **args,
         )
 
+        args = {
+            "alpha_fwd" : input_scalar * self.inv_rank,
+            "alpha_bwd" : input_scalar * self.inv_rank,
+        }
         out_dim = 2 * r * Dk
         self.linear_BkBv = build_module(
             submodules.linear_BkBv,
@@ -1168,8 +1222,7 @@ class SelfDiffAttentionV2(DiffAttentionV2):
             parallel_mode='duplicated',
             is_expert=False,
             tp_comm_buffer_name='BkBv',
-            alpha_fwd=input_scalar * self.inv_rank,
-            alpha_bwd=input_scalar * self.inv_rank,
+            **args,
         )
         w = self.linear_BkBv.weight
         b = getattr(self.linear_BkBv, "bias", None)
@@ -1282,7 +1335,11 @@ class SelfDiffAttentionV2(DiffAttentionV2):
         gate_dim = Dk if self.config.gate_attn else 0
 
         out, _ = self.linear_in(hidden_states) # [L, B, super_head_dim * num_super_heads]
-        mixed_in, normed_hidden_states = out
+        if self.config.use_geodesic_norm:
+            mixed_in = out
+            normed_hidden_states = hidden_states
+        else:
+            mixed_in, normed_hidden_states = out
         mixed_in = rearrange(mixed_in, "l b (H p) -> l b H p", H=self.num_super_heads_per_partition)
         # split per super head: [L, B, H_super_local, super_head_dim]
         mixed_heads = mixed_in[..., 0:4*Dk]; accum = 4*Dk

@@ -1257,6 +1257,10 @@ def validate_args(args, defaults={}):
             args.recompute_granularity != 'full'
         ), 'recompute_granularity must not be full when CUDA Graphs are enabled.'
 
+    if args.complete_slw:
+        assert args.training_sequence_length % args.slw_end == 0, "For complete SLW, sequence length must be divisible by the SLW end window size."
+        assert args.micro_batch_size == 1, "Complete SLW only supports micro batch size of 1."
+
     # Print arguments.
     _print_args("arguments", args)
 
@@ -1760,6 +1764,7 @@ def _add_dragon_args(parser):
     group.add_argument('--slw-start', type=int, default=0)
     group.add_argument('--slw-end', type=int, default=0)
     group.add_argument('--slw-increment', type=int, default=0)
+    group.add_argument('--complete-slw', action='store_true')
     group.add_argument('--moe-router-type', type=str, default="classic")
     group.add_argument("--no-mixer-gn", dest="mixer_gn", action="store_false")
     group.add_argument('--reset-training', action='store_true')
@@ -1784,6 +1789,7 @@ def _add_dragon_args(parser):
     group.add_argument('--hidden-size-base', type=int, default=None)
     group.add_argument('--layers-mixer-config-base', type=str, default=None)
     group.add_argument('--use-ddl', action='store_true')
+    group.add_argument('--use-geodesic-norm', action='store_true')
 
     return parser
 
@@ -3281,6 +3287,15 @@ def _add_moe_args(parser):
                        'The expert bias is updated based on the number of assigned tokens to each expert in a global batch, '
                        'where the bias is increased for the experts with less assigned tokens and decreased for the experts with more assigned tokens. '
                        'The default value 1e-3 is same as that used in DeepSeekV3.')
+    group.add_argument('--moe-router-bias-use-pid', action='store_true',
+                       help='Use a PID controller instead of the sign-based step for expert bias updates. '
+                       'Provides smoother convergence to load balance equilibrium.')
+    group.add_argument('--moe-router-bias-pid-kp', type=float, default=1e-3,
+                       help='Proportional gain (Kp) for the PID expert bias controller.')
+    group.add_argument('--moe-router-bias-pid-ki', type=float, default=1e-4,
+                       help='Integral gain (Ki) for the PID expert bias controller.')
+    group.add_argument('--moe-router-bias-pid-kd', type=float, default=1e-4,
+                       help='Derivative gain (Kd) for the PID expert bias controller.')
     group.add_argument('--moe-router-force-load-balancing', action='store_true',
                        help='[Experimental] Force override routing to balance token distribution using random logits for MoE routers, supporting naive top-k and group-limited top-k. This experimental feature is for benchmarking purposes only!')
     group.add_argument('--moe-router-padding-for-quantization', action='store_true',

@@ -9,7 +9,7 @@ from typing import Any, Dict, Optional, Union, Tuple
 import torch
 import torch.distributed
 from torch import Tensor
-
+import torch.nn as nn
 from megatron.core import parallel_state, tensor_parallel
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import apply_prefix_mapping
@@ -200,7 +200,36 @@ def get_dragon_layer_offset(
         offset = 0
     return offset
 
+class DragonGeodesicNorm(nn.Module):
+    def __init__(self, config: DragonConfig, layer_idx: int):
+        super().__init__()
 
+        self.scale = nn.Parameter(torch.tensor(1.))
+        self.bias = nn.Parameter(torch.tensor(0.))
+        self.clamp = torch.pi/4
+        self.register_buffer("layer_idx", torch.tensor(layer_idx), persistent=False)
+        if config.sequence_parallel:
+            setattr(self.scale, 'tp_sync', True)
+            setattr(self.bias, 'tp_sync', True)
+
+    @torch.compile
+    def forward(self, x, g):
+        """
+        x: residual;
+        g: ffn(x) or attn(x);
+        """
+
+        gradient = g - (x * g).sum(dim=-1,keepdim=True) / (torch.norm(x, p=2, dim=-1, keepdim=True) ** 2) * x
+        tangent_norm = torch.norm(gradient, p=2, dim=-1, keepdim=True)
+        safe_tangent_norm = torch.clamp(tangent_norm, min=1e-8)
+        unit_tangent = gradient / safe_tangent_norm
+        R = torch.norm(x, p=2, dim=-1, keepdim=True)
+        safe_R = torch.clamp(R, min=1e-6)
+        theta = torch.clamp(safe_tangent_norm / safe_R, max=self.clamp)
+        theta = torch.clamp((theta * self.scale + self.bias) / self.layer_idx, max=self.clamp)
+        output = x * torch.cos(theta) + unit_tangent * safe_R * torch.sin(theta)
+        return output
+    
 @dataclass
 class DragonLayerSubmodules:
     """
@@ -290,7 +319,7 @@ class DragonLayer(GraphableMegatronModule, BaseDragonLayer):
             self.config, vp_stage, get_pg_rank(pg_collection.pp)
         )
         self.layer_number = layer_number + layer_offset
-        print("Layer number : ", layer_number, " | Layer Offset: ", layer_offset, "| Adjusted Layer number : ", self.layer_number, " | VP stage: ", vp_stage)
+        #print("Layer number : ", layer_number, " | Layer Offset: ", layer_offset, "| Adjusted Layer number : ", self.layer_number, " | VP stage: ", vp_stage)
 
         lns = 1.
         if self.config.use_lns:
@@ -438,6 +467,10 @@ class DragonLayer(GraphableMegatronModule, BaseDragonLayer):
             self.ddl_mlp = DeepDeltaResidualExpanded(self.config, input_scalar=lns)
             self._compiled_ddl_mlp = torch.compile(self.ddl_mlp)
 
+        if self.config.use_geodesic_norm:
+            self.geodesic_mixer = DragonGeodesicNorm(self.config, self.layer_number)
+            self.geodesic_mlp = DragonGeodesicNorm(self.config, self.layer_number)
+
         a, b = 1., 1.
         if self.config.use_uscaling:
             a = self.config.uscaling_tau ** (0.5)
@@ -497,7 +530,9 @@ class DragonLayer(GraphableMegatronModule, BaseDragonLayer):
             )
         nvtx_range_pop(suffix="mixer_proj")
         # print("Before mixer residual write: ", residual.shape, " y_mixer shape: ", y_mixer.shape)
-        if not self.config.use_ddl:
+        if self.config.use_geodesic_norm:
+            residual = self.geodesic_mixer(residual, y_mixer)
+        elif not self.config.use_ddl:
             residual = self._torch_compiled_residual_write(residual, y_mixer, self.b, self.a)
         else:
             residual = self._compiled_ddl_mixer(residual, k_in=y_mixer, v_in=x_in, context=hidden_states, scalar=self.a)
@@ -544,7 +579,9 @@ class DragonLayer(GraphableMegatronModule, BaseDragonLayer):
                 f"average mlp time: {self.mlp_duration / (self.nb_forward-1)} ms",
             )
         #"""
-        if not self.config.use_ddl:
+        if self.config.use_geodesic_norm:
+            residual = self.geodesic_mlp(residual, y_mlp)
+        elif not self.config.use_ddl:
             residual = self._torch_compiled_residual_write(residual, y_mlp, self.b, self.a)
         else:
             residual = self._compiled_ddl_mlp(residual, k_in=y_mlp, v_in=x_in, context=hidden_states, scalar=self.a)
