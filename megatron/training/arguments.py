@@ -1913,6 +1913,11 @@ def _add_logging_args(parser):
 
     group.add_argument('--log-params-norm', action='store_true',
                        help='If set, calculate and log parameters norm.')
+    group.add_argument('--log-grad-norm-per-param', action='store_true',
+                       help='If set, calculate and log the L2 gradient norm for each '
+                       'parameter individually to wandb (under grad-norm-per-param/ prefix). '
+                       'Useful for debugging training instabilities. '
+                       'Only computed at log intervals.')
     group.add_argument('--log-num-zeros-in-grad', action='store_true',
                        help='If set, calculate and log the number of zeros in gradient.')
     group.add_argument('--log-throughput', action='store_true',

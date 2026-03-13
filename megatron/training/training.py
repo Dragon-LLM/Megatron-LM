@@ -1621,6 +1621,28 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
         unwrapped_model = unwrap_model(model[0])
         unwrapped_model.cancel_gradients_last_layer(args.curr_iteration)
 
+    # Compute per-parameter gradient norms before optimizer step (pre-clip).
+    # Done here because main_grad is still available on model params.
+    if getattr(args, 'log_grad_norm_per_param', False) and \
+            hasattr(args, 'curr_iteration') and \
+            args.curr_iteration % args.log_interval == 0:
+        per_param_grad_norms = {}
+        for chunk_idx, model_chunk in enumerate(model):
+            prefix = f"chunk{chunk_idx}/" if len(model) > 1 else ""
+            for name, param in model_chunk.named_parameters():
+                grad = getattr(param, 'main_grad', None)
+                if grad is None:
+                    grad = param.grad
+                if grad is not None:
+                    # Remove torch.compile wrapper prefixes (e.g. "_orig_mod.")
+                    clean_name = name.replace("_orig_mod.", "")
+                    per_param_grad_norms[prefix + clean_name] = torch.norm(
+                        grad.detach().float(), 2.0
+                    ).item()
+        args._per_param_grad_norms = per_param_grad_norms
+    else:
+        args._per_param_grad_norms = None
+
     # Update parameters.
 
     timers('optimizer', log_level=1).start(barrier=args.barrier_with_L1_time)
@@ -1856,6 +1878,12 @@ def training_log(
             writer.add_scalar('grad-norm vs samples', grad_norm, args.consumed_train_samples)
             if wandb_writer:
                 wandb_writer.log({'grad-norm': grad_norm}, iteration)
+        if wandb_writer and getattr(args, '_per_param_grad_norms', None):
+            wandb_writer.log(
+                {f'grad-norm-per-param/{k}': v
+                 for k, v in args._per_param_grad_norms.items()},
+                iteration,
+            )
         if num_zeros_in_grad is not None:
             writer.add_scalar('num-zeros', num_zeros_in_grad, iteration)
             writer.add_scalar(
