@@ -116,14 +116,14 @@ def get_dragon_block_spec(
         )
     )
     mamba3 = ModuleSpec(
-        module=FastMamba3, #if config.tensor_model_parallel_size == 1 else TPFastMamba3,
+        module=FastMamba3,
         submodules=Mamba3Submodules(
             in_proj=TELayerNormColumnParallelLinear if not config.use_geodesic_norm else TEColumnParallelLinear,
             b_norm=TENorm,
             c_norm=TENorm,
             rope_proj=TELinear,
             output_norm=TENorm if not config.use_geodesic_norm else IdentityOp,
-            dyn_proj=TELinear if config.mamba3_fast else IdentityOp,
+            dyn_proj=TELinear,
         ),
     )
     if backend.fuse_layernorm_and_linear():

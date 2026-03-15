@@ -289,26 +289,10 @@ class DragonLayer(GraphableMegatronModule, BaseDragonLayer):
         layer_mixer_type: str,
         layer_mlp_type: str,
         layer_number: int = 1,
-        vocab_size: int = 50000,
-        use_ve: bool = False,
         pg_collection: Optional[ProcessGroupCollection] = None,
         vp_stage: Optional[int] = None,
     ):
         super().__init__(config=config, vp_stage=vp_stage)
-        #global CONFIG_MLP
-        #if CONFIG_MLP is None:
-        CONFIG_MLP = config
-            #CONFIG_MLP.fp8 = "hybrid"
-            
-            
-        #print("INIT of layer", layer_mixer_type, layer_number)
-        
-        #self.mlp_duration = 0.0
-        #self.attention_duration = 0.0
-        #self.nb_forward = 0
-        #self.start_of_layer = torch.cuda.Event(enable_timing=True)
-        #self.end_of_attention = torch.cuda.Event(enable_timing=True)
-        #self.end_of_mlp = torch.cuda.Event(enable_timing=True)
 
         if pg_collection is None:
             pg_collection = ProcessGroupCollection.use_mpu_process_groups()
@@ -340,8 +324,6 @@ class DragonLayer(GraphableMegatronModule, BaseDragonLayer):
                 submodules.attention if layer_mixer_type == 'T' else submodules.attention_v2,
                 config=self.config,
                 layer_number=self.layer_number,
-                vocab_size=vocab_size,
-                use_ve=use_ve,
                 input_scalar=lns,
                 **attention_optional_kwargs,
             )
@@ -353,8 +335,6 @@ class DragonLayer(GraphableMegatronModule, BaseDragonLayer):
                 submodules.gdn,
                 config=self.config,
                 layer_number=self.layer_number,
-                vocab_size=vocab_size,
-                use_ve=use_ve,
                 input_scalar=lns,
                 pg_collection=pg_collection,
             )
@@ -366,8 +346,6 @@ class DragonLayer(GraphableMegatronModule, BaseDragonLayer):
                 submodules.mamba3,
                 config=self.config,
                 layer_number=self.layer_number,
-                vocab_size=vocab_size,
-                use_ve=use_ve,
                 input_scalar=lns,
                 pg_collection=pg_collection,
             )
@@ -513,9 +491,7 @@ class DragonLayer(GraphableMegatronModule, BaseDragonLayer):
         # this is only used to uniquely identify decode and non-decode cuda graph
         # runners in the cuda graph manager
         kwargs.pop("dynamic_inference_decode_only", None)
-        #self.start_of_layer.record()
-        residual, x_in, hidden_states, y_mixer, stashed_hs = self._forward_mixer(*args, **kwargs) # (L, B, H, D)
-        #print("After mixer forward: ", hidden_states.shape, " y_mixer shape: ", y_mixer.shape)
+        residual, x_in, hidden_states, y_mixer = self._forward_mixer(*args, **kwargs) # (L, B, H, D)
         if self.config.mixer_gn:
             y_mixer = self._torch_compiled_headwise_norm(y_mixer)
         y_mixer = y_mixer.view(y_mixer.size(0), y_mixer.size(1), -1) # (L, B, H*D)
@@ -529,16 +505,13 @@ class DragonLayer(GraphableMegatronModule, BaseDragonLayer):
                 y_mixer, None, name="mixer_proj", forced_released_tensors=[y_mixer]
             )
         nvtx_range_pop(suffix="mixer_proj")
-        # print("Before mixer residual write: ", residual.shape, " y_mixer shape: ", y_mixer.shape)
+
         if self.config.use_geodesic_norm:
             residual = self.geodesic_mixer(residual, y_mixer)
         elif not self.config.use_ddl:
             residual = self._torch_compiled_residual_write(residual, y_mixer, self.b, self.a)
         else:
             residual = self._compiled_ddl_mixer(residual, k_in=y_mixer, v_in=x_in, context=hidden_states, scalar=self.a)
-            #print("After mixer residual write: ", residual.shape)
-            #self.end_of_attention.record()
-            # print("After mixer residual write: ", residual.shape)
         
         hidden_states = self.pre_mlp_norm(residual)
 
@@ -556,37 +529,17 @@ class DragonLayer(GraphableMegatronModule, BaseDragonLayer):
             mlp_fp8_context = nullcontext()
 
         with mlp_fp8_context:
-            x_in, hidden_states, out = self._forward_mlp(residual, hidden_states, stashed_hs, kwargs.get("inference_context", None))
-        stashed_hs = None
-        if self.is_moe_layer:
-            y_mlp = out[0]
-            stashed_hs = out[4]
-        else:
-            y_mlp = out[0]
-        #self.end_of_mlp.record()
-        #torch.cuda.synchronize()
-        """
-        if self.nb_forward != 0:
-            self.attention_duration += self.start_of_layer.elapsed_time(self.end_of_attention)
-            self.mlp_duration += self.end_of_attention.elapsed_time(self.end_of_mlp)
-        self.nb_forward += 1
-        if self.nb_forward % 100 == 0:
-            log_single_rank(
-                logger,
-                logging.INFO,
-                f"Layer {self.layer_number} average attention time: "
-                f"{self.attention_duration / (self.nb_forward-1)} ms, "
-                f"average mlp time: {self.mlp_duration / (self.nb_forward-1)} ms",
-            )
-        #"""
+            x_in, hidden_states, out = self._forward_mlp(residual, hidden_states, kwargs.get("inference_context", None))
+
+        y_mlp = out[0]
+
         if self.config.use_geodesic_norm:
             residual = self.geodesic_mlp(residual, y_mlp)
         elif not self.config.use_ddl:
             residual = self._torch_compiled_residual_write(residual, y_mlp, self.b, self.a)
         else:
             residual = self._compiled_ddl_mlp(residual, k_in=y_mlp, v_in=x_in, context=hidden_states, scalar=self.a)
-        #print("After final residual write: ", residual.shape, flush=True)
-        return residual, stashed_hs
+        return residual
 
     def _forward_mixer(
         self,
@@ -598,11 +551,9 @@ class DragonLayer(GraphableMegatronModule, BaseDragonLayer):
         rotary_pos_cos_sin: Optional[Tensor] = None,
         attention_bias: Optional[Tensor] = None,
         window_size: Optional[Tuple[int, int]] = None,
-        input_ids: Optional[Tensor] = None,
         inference_context: Optional[Any] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
         sequence_len_offset: Optional[Tensor] = None,
-        stashed_hs: Optional[Tensor] = None,
         *,
         inference_params: Optional[Any] = None,
     ):
@@ -658,15 +609,14 @@ class DragonLayer(GraphableMegatronModule, BaseDragonLayer):
             rotary_pos_cos_sin=rotary_pos_cos_sin,
             attention_bias=attention_bias,
             window_size=window_size,
-            input_ids=input_ids,
             packed_seq_params=packed_seq_params,
             sequence_len_offset=sequence_len_offset,
         )
         nvtx_range_pop(suffix="mixer")
 
-        return residual, x_in, normed_hidden_states, y_mixer, stashed_hs
+        return residual, x_in, normed_hidden_states, y_mixer
 
-    def _forward_mlp(self, residual, hidden_states, stashed_hs, inference_context=None):
+    def _forward_mlp(self, residual, hidden_states, inference_context=None):
         """
         Perform a forward pass through the feed-forward layer.
 
@@ -745,11 +695,7 @@ class DragonLayer(GraphableMegatronModule, BaseDragonLayer):
             bias_output = torch.stack(bias_chunks, dim=0).sum(dim=0) if bias_chunks else None
             mlp_output_with_bias = (mlp_output, bias_output)
         else:
-            mlp_output_with_bias = self.mlp(pre_mlp_layernorm_output, stashed_hs)
-            #print("MLP output with bias type: ", mlp_output_with_bias)
-            #output, mlp_bias, routing_map, stashed_hs
-            #print("MLP output : ", mlp_output, " | Bias: ", bias)
-            #mlp_output_with_bias = (mlp_output.to(torch.bfloat16), bias)
+            mlp_output_with_bias = self.mlp(pre_mlp_layernorm_output)
             
         if self.recompute_pre_mlp_layernorm:
             # discard the output of the pre-mlp layernorm and register the recompute

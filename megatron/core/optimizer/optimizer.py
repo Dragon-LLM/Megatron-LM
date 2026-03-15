@@ -1222,7 +1222,6 @@ class ChainedOptimizer(MegatronOptimizer):
         if isinstance(state_dict, dict):
             state_dict = (v for k, v in sorted(state_dict.items()))
         for optimizer, state in zip(self.chained_optimizers, state_dict):
-            #print(state)
             optimizer.load_state_dict(state)
         self._synchronize_steps()
 

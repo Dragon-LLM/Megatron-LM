@@ -1185,23 +1185,6 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
         config = get_model_config(model[0])
         model = [Float16Module(config, model_module) for model_module in model]
 
-    """def _setattr_by_dotted_name(root: nn.Module, dotted: str, new_value):
-        parts = dotted.split(".")
-        parent = root
-        for p in parts[:-1]:
-            parent = getattr(parent, p)
-        setattr(parent, parts[-1], new_value)
-    def promote_selected_params_to_fp32(root: nn.Module, match_any: tuple[str, ...]):
-        for name, p in list(root.named_parameters()):
-            if any(key in name for key in match_any):
-                new_p = nn.Parameter(p.detach().to(torch.float32), requires_grad=p.requires_grad)
-                _setattr_by_dotted_name(root, name, new_p)
-    for m in model:
-        promote_selected_params_to_fp32(
-            m,
-            match_any=("B_bias", "C_bias", "in_proj_mimo_x", "in_proj_mimo_z", "out_proj_mimo"),
-        )"""
-
     # Materialize tensors on meta device (GPU allocation) if not using FSDP2 and not using Megatron FSDP.
     if args.init_model_with_meta_device and not args.use_torch_fsdp2 and not args.use_megatron_fsdp:
         #for model_module in model:

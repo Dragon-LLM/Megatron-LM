@@ -9,12 +9,13 @@ import logging
 import math
 from dataclasses import dataclass, replace
 from typing import List, Optional, Tuple, Union
-from contextlib import nullcontext
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
+
+from einops import rearrange
 
 from megatron.core.tensor_parallel.mappings import gather_from_sequence_parallel_region
 from megatron.core.inference.contexts import BaseInferenceContext
@@ -29,13 +30,9 @@ from megatron.core.transformer.utils import (
     sharded_state_dict_default,
 )
 from megatron.core.utils import deprecate_inference_params, log_single_rank, make_tp_sharded_tensor_for_checkpoint, nvtx_range_pop, nvtx_range_push
-from megatron.core.dist_checkpointing import ShardedTensor
-from megatron.core.dist_checkpointing.mapping import ShardedTensor, ShardedTensorFactory, ReplicaId
+
 
 try:
-    #from dragon_mamba3_ops.mimo_variant.ssd_mimo import mamba_chunk_scan_discretized_fused_combined as mamba_mimo_chunk_scan_discretized_fused_combined
-    #from dragon_mamba3_ops.angle_cumsum import angle_dt
-    #from dragon_mamba3_ops.rotary_mamba_mimo import rotary_qk as mimo_rotary_qk
     from mamba_ssm.ops.triton.layernorm_gated import RMSNorm as RMSNormGated
 
     HAVE_MAMBA_SSM = True
@@ -44,58 +41,13 @@ except ImportError:
 
 try:
     from dragon_mamba3_fast.fused_mimo_variant.mamba3_tilelang import mamba3_tilelang
-    #if not HAVE_MAMBA_SSM:
     from dragon_mamba3_fast.angle_cumsum import angle_dt
     HAVE_FAST_MAMBA_SSM = True
 except ImportError as e:
-    #from dragon_mamba3_ops.fused_mimo_variant.mamba3_tilelang import mamba3_tilelang
-    #if not HAVE_MAMBA_SSM:
-    #   from dragon_mamba3_ops.angle_cumsum import angle_dt
-    raise e
     HAVE_FAST_MAMBA_SSM = True
-    print("dragon_mamba3_fast not found")
-
-try:
-    from einops import rearrange
-
-    HAVE_EINOPS = True
-except ImportError:
-    HAVE_EINOPS = False
-
+    raise e
 
 logger = logging.getLogger(__name__)
-
-
-class ExtendedEmbedding(torch.nn.Embedding):
-    """
-    torch.nn.Embedding with sharded state dict.
-    """
-
-    def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
-        """Sharding along axis 1 (embedding dim)."""        
-        state_dict = self.state_dict(prefix="", keep_vars=True)
-        weight_prefix = f"{prefix}weight"
-        return {
-            weight_prefix: make_tp_sharded_tensor_for_checkpoint(
-                tensor=state_dict["weight"],
-                key=weight_prefix,
-                tp_axis=1,
-                allow_shape_mismatch=True,
-                prepend_offsets=sharded_offsets,
-            )
-        }
-
-class ExtendedRMSNorm(RMSNormGated):
-    """
-    RMSNormGated with sharded state dict.
-    """
-
-    def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
-        """Sharding along axis 0, bias not sharded"""
-        state_dict = self.state_dict(prefix="", keep_vars=True)
-        return make_sharded_tensors_for_checkpoint(
-            state_dict, prefix, {"weight": 0}, sharded_offsets
-        )
 
 @dataclass
 class Mamba3Submodules:
@@ -110,45 +62,12 @@ class Mamba3Submodules:
     output_norm: Union[ModuleSpec, type] = None
     dyn_proj: Union[ModuleSpec, type] = None
 
-
-class Dynamic_erf(nn.Module):
-    def __init__(self, normalized_shape, alpha_init_value=0.5, shift_init_value=0.0):
-        super().__init__()
-        self.normalized_shape = normalized_shape
-        self.alpha_init_value = alpha_init_value
-        self.shift_init_value = shift_init_value
-
-        self.alpha = nn.Parameter(torch.ones(1) * alpha_init_value)
-        self.shift = nn.Parameter(torch.ones(1) * shift_init_value)
-        self.weight = nn.Parameter(torch.ones(normalized_shape))
-        self.bias = nn.Parameter(torch.zeros(normalized_shape))
-        
-        # --- FIX START ---
-        # Mark these as Tensor Parallel so the optimizer knows they are split
-        setattr(self.weight, "tensor_model_parallel", True)
-        setattr(self.bias, "tensor_model_parallel", True)
-        
-        # Alpha and Shift are global scalars. They should NOT be marked tensor_model_parallel.
-        # Instead, we mark them as tp_sync so gradients are summed across TP ranks.
-        setattr(self.alpha, "tp_sync", True)
-        setattr(self.shift, "tp_sync", True)
-        # --- FIX END ---
-
-    #@torch.compile
-    def forward(self, x):
-        return self.weight * torch.erf(self.alpha * x + self.shift) + self.bias
-
-    def extra_repr(self):
-        return f'normalized_shape={self.normalized_shape}, alpha_init_value={self.alpha_init_value}'
-
 class FastMamba3(MegatronModule):
     def __init__(
         self,
         config: DragonConfig,
         submodules: Mamba3Submodules,
         layer_number: int,
-        vocab_size: int = 50000,
-        use_ve: bool = False,
         input_scalar: float = 1.,
         pg_collection: ProcessGroupCollection = None,
     ):
@@ -156,9 +75,6 @@ class FastMamba3(MegatronModule):
             raise ImportError(
                 "MambaSSM is not installed. Please install it with `pip install mamba-ssm`."
             )
-
-        if not HAVE_EINOPS:
-            raise ImportError("einops is required by the Mamba model but cannot be imported")
 
         super().__init__(config)
         self.config = config
@@ -196,6 +112,7 @@ class FastMamba3(MegatronModule):
         self.mimo_dim = self.config.mamba_mimo_dim
         self.mimo_proj_block_order = self.config.mamba_mimo_proj_block_order
 
+        assert self.ngroups == 1
         assert self.d_state is not None and self.d_state > 0
         assert self.headdim is not None and self.headdim > 0
         assert self.ngroups is not None and self.ngroups > 0
@@ -240,8 +157,6 @@ class FastMamba3(MegatronModule):
         # Ensure that each group has a positive integer number of heads:
         assert self.nheads % self.ngroups == 0, "nheads must be evenly divisible by ngroups"
 
-        # Assume sequence parallelism: input is already partitioned along the sequence dimension
-        
         if not self.config.use_geodesic_norm:
             args = {
                 "alpha_fwd": input_scalar,
@@ -253,11 +168,11 @@ class FastMamba3(MegatronModule):
                 "alpha_fwd": input_scalar,
                 "alpha_bwd": input_scalar,
             }
-                
+
         self.in_proj = build_module(
             submodules.in_proj,
             self.d_model,
-            self.d_inner * 2 + 3 * self.nheads,  # z x B C dt A trap #angle
+            self.d_inner * 2 + 3 * self.nheads,  # z x dt A trap angle
             config=self.config,
             init_method=self.config.init_method,
             gather_output=False,
@@ -268,8 +183,7 @@ class FastMamba3(MegatronModule):
             tp_group=self.pg_collection.tp,
             **args,
         )
-        # WARNING: A_proj was specified as "float32". here, we merge it with in_proj so it's no longer float32.
-        self.dim_dyn_output = 2 * self.ngroups * self.d_state * self.mimo_dim + self.num_rope_angles
+
         args = {
             "alpha_fwd": input_scalar,
             "alpha_bwd": input_scalar,
@@ -277,7 +191,7 @@ class FastMamba3(MegatronModule):
         self.in_proj_dyn = build_module(
             submodules.dyn_proj,
             self.config.hidden_size,
-            self.dim_dyn_output,
+            2 * self.ngroups * self.d_state * self.mimo_dim + self.num_rope_angles, # B C angle
             config=self.config,
             init_method=self.config.init_method,
             bias=False,
@@ -300,23 +214,12 @@ class FastMamba3(MegatronModule):
             setattr(w, 'average_gradients_across_tp_domain', True)
             if b is not None:
                 setattr(b, 'average_gradients_across_tp_domain', True)
-    
-        self.use_ve = use_ve
-        if use_ve:
-            self.ve_embedding = ExtendedEmbedding(
-                num_embeddings=vocab_size,
-                embedding_dim=self.ngroups_local_tp*self.d_inner_per_group,
-            )
-            with torch.no_grad():
-                self.ve_embedding.weight.normal_(mean=0.0, std=config.init_embedding_std)
-            setattr(self.ve_embedding.weight, 'tensor_model_parallel', True)
-            self.ve_scalars = torch.nn.Parameter(torch.zeros(self.ngroups_local_tp, self.d_inner_per_group)) #, dtype=torch.float32))
-            setattr(self.ve_scalars, 'tensor_model_parallel', True)
 
         self.B_bias = nn.Parameter(torch.ones((self.nheads_local_tp, self.mimo_dim, self.d_state), dtype=torch.float32), requires_grad=True)
         self.C_bias = nn.Parameter(torch.ones((self.nheads_local_tp, self.mimo_dim, self.d_state), dtype=torch.float32), requires_grad=True)
         setattr(self.B_bias, "tensor_model_parallel", True)
         setattr(self.C_bias, "tensor_model_parallel", True)
+
         self.B_norm = build_module(
             submodules.b_norm,
             hidden_size=self.d_state,
@@ -333,7 +236,6 @@ class FastMamba3(MegatronModule):
         setattr(self.C_norm.weight, "tp_sync", True)
 
         # Initialize up/down MIMO projection (for x and z)
-        # print("Mamba Head dim: ", self.headdim)
         in_proj_mimo_x_init_weights = torch.ones(self.nheads_local_tp, self.mimo_dim, self.headdim, dtype=torch.float32)/self.mimo_dim
         in_proj_mimo_z_init_weights = torch.ones(self.nheads_local_tp, self.mimo_dim, self.headdim, dtype=torch.float32)
         out_proj_mimo_init_weights = torch.ones(self.nheads_local_tp, self.mimo_dim, self.headdim, dtype=torch.float32)/self.mimo_dim
@@ -344,8 +246,7 @@ class FastMamba3(MegatronModule):
         setattr(self.in_proj_mimo_z, "tensor_model_parallel", True)
         setattr(self.out_proj_mimo, "tensor_model_parallel", True)
 
-        #with get_cuda_rng_tracker().fork():
-        with nullcontext():
+        with get_cuda_rng_tracker().fork():
             dt_min = 0.001
             dt_max = 0.1
             dt_init_floor = 1e-4
@@ -376,12 +277,7 @@ class FastMamba3(MegatronModule):
         self.D._no_weight_decay = True # useless flag
         setattr(self.D, "tensor_model_parallel", True)
 
-        #self.output_norm = Dynamic_erf(
-        #    normalized_shape=self.d_inner_local_tp,
-        #)
-        #self.output_norm = torch.compile(self.output_norm)
-        
-        self.output_norm=build_module(
+        self.output_norm = build_module(
             submodules.output_norm,
             hidden_size=self.d_inner,
             config=self.config,
@@ -391,18 +287,7 @@ class FastMamba3(MegatronModule):
         if w is not None:
             w.tp_sync = True
 
-        self.n_repeat = self.nheads_local_tp // self.ngroups
         self.window_size = 0
-        #print(f"Repeating B and C for n_repeat={n_repeat} because ngroups={self.ngroups} != nheads={self.nheads}")
-
-        # In TPFastMamba3.__init__, at the very end:
-        #print("\n=== DEBUG: TPFastMamba3 Parameters ===")
-        #for name, p in self.named_parameters():
-        #    print(f"Name: {name} | Size: {p.shape}")
-        #    if name == 'param':
-        #        print("!!! FOUND INVALID PARAMETER 'param' !!!")
-        #print("======================================\n")
-
 
     def forward(
         self,
@@ -416,7 +301,6 @@ class FastMamba3(MegatronModule):
         rotary_pos_cos_sin: Optional[Tensor] = None,
         attention_bias: Optional[Tensor] = None,
         window_size: Optional[Tuple[int, int]] = None, # not used, for compatibility
-        input_ids: Optional[Tensor] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
         sequence_len_offset: Optional[int] = None,
         *,
@@ -428,19 +312,22 @@ class FastMamba3(MegatronModule):
         """
 
         #self._maintain_float32_params()
-        #print(f"Mamba3 forward pass with TPFast: hidden_states shape {hidden_states.shape}")
         inference_context = deprecate_inference_params(inference_context, inference_params)
         in_inference_mode = inference_context is not None and not self.training
         assert not in_inference_mode
 
         # Input projection
         nvtx_range_push(suffix="M3_input_proj")
-        out, out2 = self.in_proj(hidden_states)
+        out, _ = self.in_proj(hidden_states)
+
         if self.config.use_geodesic_norm:
             zxdtAtrap = out
             normed_hidden_states = hidden_states
         else:
             zxdtAtrap, normed_hidden_states = out
+        
+        BCangle, _ = self.in_proj_dyn(normed_hidden_states)
+
         if self.config.complete_slw:
             assert window_size is not None, "window_size must be provided for complete SLW"
             seq_len, batch_size, dim = zxdtAtrap.shape
@@ -453,38 +340,32 @@ class FastMamba3(MegatronModule):
             else:
                 lwindow_size = window_size[0]
             if lwindow_size != self.window_size:
-                print(f"Updating Mamba3 window size to {lwindow_size} for complete SLW")
+                #print(f"Updating Mamba3 window size to {lwindow_size} for complete SLW")
                 self.window_size = lwindow_size         
             complete_slw_batch_size = int(batch_size * (seq_len // lwindow_size))
-            print("Reshaping zxdtAtrap for complete SLW: ", zxdtAtrap.shape, "->", (lwindow_size, complete_slw_batch_size, dim))
+            #print("Reshaping zxdtAtrap for complete SLW: ", zxdtAtrap.shape, "->", (lwindow_size, complete_slw_batch_size, dim))
             zxdtAtrap = zxdtAtrap.reshape(lwindow_size, complete_slw_batch_size, dim)
-        #return zxdtAtrap, 0
-        #print(f"After in_proj: zxdtAtrap shape {zxdtAtrap.shape}, normed_hidden_states shape {normed_hidden_states.shape}")
-        BCangle, _ = self.in_proj_dyn(normed_hidden_states)
-        #print(f"After in_proj_dyn: BC shape {BC.shape}")
-        offset = 0
-        z = zxdtAtrap[..., offset : offset + self.d_inner_local_tp]; offset += self.d_inner_local_tp
-        x = zxdtAtrap[..., offset : offset + self.d_inner_local_tp]; offset += self.d_inner_local_tp
-        dt = zxdtAtrap[..., offset : offset + self.nheads_local_tp]; offset += self.nheads_local_tp
-        A = zxdtAtrap[..., offset : offset + self.nheads_local_tp]; offset += self.nheads_local_tp
-        trap = zxdtAtrap[..., offset : offset + 2 * self.nheads_local_tp] # Trap might need 2x? check dim
-        #print(f"ngroups: {self.ngroups}, mimo_dim: {self.mimo_dim}, d_state: {self.d_state}")
-        B = BCangle[..., 0:self.ngroups*self.mimo_dim*self.d_state]
-        C = BCangle[..., self.ngroups*self.mimo_dim*self.d_state:2*self.ngroups*self.mimo_dim*self.d_state]
-        angle = BCangle[..., 2*self.ngroups*self.mimo_dim*self.d_state:] # (L, B, S)
 
-        z = rearrange(z, "l b (G h p) -> b l (G h) p",G=self.ngroups, p=self.headdim)
-        x = rearrange(x, "l b (G h p) -> b l (G h) p", G=self.ngroups, p=self.headdim)
-        B = rearrange(B, "b l (G r n) -> b l r G n", G=self.ngroups, r=self.mimo_dim)
-        C = rearrange(C, "b l (G r n) -> b l r G n", G=self.ngroups, r=self.mimo_dim)
-        dt = rearrange(dt, "l b n -> b l n").to(torch.float32)
-        A = rearrange(A, "l b n -> b l n")
+        per_head = zxdtAtrap.view(*zxdtAtrap.shape[:-1], self.nheads_local_tp, 2*self.headdim+3)
+        off = 0
+        z    = per_head[..., off : off + self.headdim];   off += self.headdim # (L, B, H, p)
+        x    = per_head[..., off : off + self.headdim];   off += self.headdim # (L, B, H, p)
+        dt   = per_head[..., off];                        off += 1           # (L, B, H)
+        A    = per_head[..., off];                        off += 1           # (L, B, H)
+        trap = per_head[..., off];                        off += 1           # (L, B, H)
+        z = rearrange(z, "l b H p -> b l H p")
+        x = rearrange(x, "l b H p -> b l H p")
+        dt   = rearrange(dt, "l b n -> b l n").to(torch.float32)
+        A    = rearrange(A, "l b n -> b l n")
         trap = rearrange(trap, "l b n -> b n l")
 
-        # value embeddings
-        if self.use_ve:
-            ve = self.ve_embedding(input_ids) # (B,S, G_local*D)
-            x = x + self.ve_scalars.view(1, 1, -1) * ve
+        off = 0
+        B     = BCangle[..., off : off + self.ngroups*self.mimo_dim*self.d_state]; off += self.ngroups*self.mimo_dim*self.d_state
+        C     = BCangle[..., off : off + self.ngroups*self.mimo_dim*self.d_state]; off += self.ngroups*self.mimo_dim*self.d_state
+        angle = BCangle[..., off :]
+        B = rearrange(B, "l b (G r n) -> l b r G n", G=self.ngroups, r=self.mimo_dim)
+        C = rearrange(C, "l b (G r n) -> l b r G n", G=self.ngroups, r=self.mimo_dim)
+        nvtx_range_pop(suffix="M3_input_proj")
 
         _A = -F.softplus(A.to(torch.float32)) # (B, L, N)
         _A = torch.clamp(_A, max=-self.A_floor)
@@ -496,19 +377,16 @@ class FastMamba3(MegatronModule):
         C = self.C_norm(C)
 
         if self.config.sequence_parallel:
-            # All-Gather B and C and angle along Sequence dimension
             B = gather_from_sequence_parallel_region(B, group=self.pg_collection.tp)
             C = gather_from_sequence_parallel_region(C, group=self.pg_collection.tp)
             angle = gather_from_sequence_parallel_region(angle, group=self.pg_collection.tp)
+
         if self.config.complete_slw:
-            print("Reshaping B and C back for complete SLW: ", B.shape, "->", (lwindow_size, complete_slw_batch_size, *B.shape[2:]), " and ", C.shape, "->", (lwindow_size, complete_slw_batch_size, *C.shape[2:]))
+            #print("Reshaping B and C back for complete SLW: ", B.shape, "->", (lwindow_size, complete_slw_batch_size, *B.shape[2:]), " and ", C.shape, "->", (lwindow_size, complete_slw_batch_size, *C.shape[2:]))
             B = B.reshape(lwindow_size, complete_slw_batch_size, *B.shape[2:])
             C = C.reshape(lwindow_size, complete_slw_batch_size, *C.shape[2:])
             angle = angle.reshape(lwindow_size, complete_slw_batch_size, *angle.shape[2:])
-        #print(f"After B/C norm and gather: B shape {B.shape}, C shape {C.shape}")
-        if self.ngroups != self.nheads:
-            B = B.repeat(1, 1, 1, self.n_repeat, 1) # (B, L, R, N, S)
-            C = C.repeat(1, 1, 1, self.n_repeat, 1) # (B, L, R, N, S)
+
         B = rearrange(B, "l b r G n -> b l r G n").contiguous()
         C = rearrange(C, "l b r G n -> b l r G n").contiguous()
         a, b, c, d, e = C.size()
@@ -516,14 +394,14 @@ class FastMamba3(MegatronModule):
         a, b, c, d, e = B.size()
         B = B.as_strided(size=(a, b, c, d, e), stride=(b*c*d*e, c*d*e, d*e, e, 1))
         nvtx_range_pop(suffix="M3_mimo_BC_norm")
-            
+
         angle = angle.transpose(0, 1) # (B, L, S) 
         angle = angle.unsqueeze(-2).expand(-1, -1, self.nheads_local_tp, -1) # (B, L, G, S)
         angle = angle_dt(angle, dt)
 
         ADT = rearrange(ADT, "b l n -> b n l")
         dt = rearrange(dt, "b l n -> b n l")
-        #print(f"Before Mamba3 TileLang: C shape {C.shape}, B shape {B.shape}, x shape {x.shape}, ADT shape {ADT.shape}, dt shape {dt.shape}, trap shape {trap.shape}, angle shape {angle.shape}, D shape {self.D.shape}, z shape {z.shape}")
+
         y = mamba3_tilelang(
             Q=C.contiguous(),
             K=B.contiguous(),
@@ -546,14 +424,12 @@ class FastMamba3(MegatronModule):
         nvtx_range_pop(suffix="M3_mimo_chunk_scan")
 
         y = rearrange(y, "b l h p -> l b (h p)")
-        
-        #Terribles images cette norm nécessite un gather ? et l'output matrice en sequence parallelism ?
-        # Sinon on utilise le trick de normalisation mathématique ?
+
         y = self.output_norm(y)
 
         if self.config.complete_slw:
-            print("Reshaping output y back for complete SLW: ", y.shape, "->", (seq_len, batch_size, -1))
             y = y.reshape(seq_len, batch_size, -1)
+
         return y, normed_hidden_states
 
     def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
@@ -570,20 +446,8 @@ class FastMamba3(MegatronModule):
             "in_proj_mimo_x": 0,
             "in_proj_mimo_z": 0,
             "out_proj_mimo": 0,
-            # --- FIX START ---
-            # Add output_norm parameters to the map.
-            # weight/bias are sharded (size d_inner_local_tp).
-            #"output_norm.weight": 0,
-            #"output_norm.bias": 0,
-            # alpha/shift are scalars and replicated (tp_sync=True), so they are NOT sharded.
-            # Removing them from axis_map ensures they are saved as singleton tensors.
-            # --- FIX END ---
         }
-        if self.use_ve:
-            axis_map.update({
-                've_scalars': 0,
-            })
-        
+
         sharded_state_dict = make_sharded_tensors_for_checkpoint(
             sharded_state_dict,
             prefix,
@@ -599,33 +463,6 @@ class FastMamba3(MegatronModule):
             sharded_state_dict.update(module_sharded_sd)
 
         return sharded_state_dict
-
-        # Splitting in_proj.weight
-        #in_proj_dim = (
-        #    self.d_inner_local_tp * 2
-        #    + 3 * self.nheads_local_tp
-        #)
-        
-        # Check integrity
-        # assert sharded_state_dict[f"{prefix}in_proj.weight"].data.size(0) == in_proj_dim
-
-        """
-        sharded_state_dict[f"{prefix}in_proj.weight"] = _split_tensor_factory(
-            sharded_state_dict[f"{prefix}in_proj.weight"],
-            [
-                self.d_inner_local_tp,
-                self.d_inner_local_tp,
-                self.nheads_local_tp,
-                self.nheads_local_tp,
-                self.nheads_local_tp,
-            ],
-            ["z", "x", 
-             "dt", "A", "trap"],
-            0,
-        )
-        
-        """
-        return sharded_state_dict
     
     def _load_from_state_dict(self, *args, **kwargs):
         """Load the state dict of the router."""
@@ -636,62 +473,3 @@ class FastMamba3(MegatronModule):
         """Save the state dict of the router."""
         #self._maintain_float32_params() # switch to float32 before saving
         return super()._save_to_state_dict(*args, **kwargs)
-
-def _split_tensor_factory(
-    orig_sh_ten: ShardedTensor, split_sections: List[int], split_names: List[str], split_dim: int
-) -> ShardedTensorFactory:
-    """Builds a factory that splits a given ShardedTensor into several independent chunks."""
-    assert isinstance(orig_sh_ten, ShardedTensor), type(orig_sh_ten)
-    orig_sh_ten_no_data = orig_sh_ten.without_data()  # remove `data` reference
-
-    if sum(split_sections) != orig_sh_ten_no_data.local_shape[split_dim]:
-        raise ValueError(
-            f"Split sections must cover the whole dimension size, "
-            f"got {split_sections=} vs dimensions size "
-            f"{orig_sh_ten_no_data.local_shape[split_dim]}"
-        )
-
-    assert not isinstance(
-        split_sections, int
-    ), "Splitting into predefined section sizes is supported (`split_sections` must be a list)"
-    assert len(split_sections) == len(split_names), (len(split_sections), len(split_names))
-
-    @torch.no_grad()
-    def sh_ten_build_fn(
-        key: str, t: torch.Tensor, replica_id: ReplicaId, flattened_range: Optional[slice]
-    ):
-        factory_sh_ten = replace(
-            orig_sh_ten_no_data,
-            key=key,
-            data=t,
-            dtype=t.dtype,
-            replica_id=replica_id,
-            flattened_range=flattened_range,
-        )
-
-        chunk_sh_tens = []
-        split_start = 0
-        for split_size, split_name in zip(split_sections, split_names):
-            split_chunks = factory_sh_ten.narrow(split_dim, split_start, split_size)
-            for sh_ten in split_chunks:
-                sh_ten.key = f"{sh_ten.key}.{split_name}"
-            chunk_sh_tens.extend(split_chunks)
-            split_start += split_size
-
-        assert split_start == orig_sh_ten_no_data.local_shape[split_dim], (
-            split_start,
-            orig_sh_ten_no_data.local_shape[split_dim],
-        )
-        assert sum(sh_ten.data.numel() for sh_ten in chunk_sh_tens) == t.numel(), (
-            chunk_sh_tens,
-            t.shape,
-        )
-        return chunk_sh_tens
-
-    @torch.no_grad()
-    def sh_ten_merge_fn(sub_state_dict):
-        return torch.cat(sub_state_dict)
-
-    return ShardedTensorFactory(
-        orig_sh_ten.key, orig_sh_ten.data, sh_ten_build_fn, sh_ten_merge_fn, orig_sh_ten.replica_id
-    )

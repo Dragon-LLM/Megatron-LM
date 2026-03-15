@@ -93,8 +93,6 @@ class GatedDeltaNet(MegatronModule):
         config: DragonConfig,
         submodules: GatedDeltaNetSubmodules,
         layer_number: int = None,
-        vocab_size: int = 50000,
-        use_ve: bool = False,
         input_scalar: float = 1.,
         bias: bool = False,
         conv_bias: bool = False,
@@ -171,19 +169,6 @@ class GatedDeltaNet(MegatronModule):
             alpha_fwd=input_scalar,
             alpha_bwd=input_scalar,
         )
-
-        # VE embeddings and scalars
-        self.use_ve = use_ve
-        if use_ve:
-            self.ve_embedding = ExtendedEmbedding(
-                num_embeddings=vocab_size,
-                embedding_dim=self.num_heads_local*self.value_head_dim,
-            )
-            with torch.no_grad():
-                self.ve_embedding.weight.normal_(mean=0.0, std=config.init_embedding_std)
-            setattr(self.ve_embedding.weight, 'tensor_model_parallel', True)
-            self.ve_scalars = torch.nn.Parameter(torch.zeros(self.num_heads_local, self.value_head_dim, dtype=torch.float32))
-            setattr(self.ve_scalars, 'tensor_model_parallel', True)
 
         self.conv_dim = self.qk_dim * 2 + self.v_dim
         self.conv_dim_local_tp = self.conv_dim // self.tp_size
@@ -270,7 +255,6 @@ class GatedDeltaNet(MegatronModule):
         rotary_pos_cos_sin: Optional[Tensor] = None,
         attention_bias: Optional[Tensor] = None,
         window_size: Optional[Tuple[int, int]] = None, # not used, for compatibility
-        input_ids: Optional[Tensor] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
         sequence_len_offset: Optional[int] = None,
         *,
@@ -325,14 +309,6 @@ class GatedDeltaNet(MegatronModule):
         gate = qkvzba[..., accum:accum+self.value_head_dim]; accum += self.value_head_dim
         beta = qkvzba[..., accum:accum+1].squeeze(-1); accum += 1
         alpha = qkvzba[..., accum:accum+1].squeeze(-1)
-
-        # value embeddings
-        if self.use_ve:
-            dk, dv = self.key_head_dim, self.value_head_dim
-            q, k, v = qkv.split([dk, dk, dv], dim=-1)
-            ve = self.ve_embedding(input_ids) # (B,S, H_noise_local*D)
-            v = v + self.ve_scalars * ve.view_as(v)
-            qkv = torch.cat((q, k, v), dim=-1)
 
         # qkv: (B, L, H_local, D)
         # gate: (B, L, H_local, Dv)
@@ -418,10 +394,7 @@ class GatedDeltaNet(MegatronModule):
             'A_log': 0,
             'dt_bias': 0,
         }
-        if self.use_ve:
-            axis_map.update({
-                've_scalars': 0,
-            })
+
         # Parameters
         self._save_to_state_dict(sharded_state_dict, '', keep_vars=True)
         sharded_state_dict = make_sharded_tensors_for_checkpoint(

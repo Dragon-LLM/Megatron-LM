@@ -144,7 +144,7 @@ class MLP(MegatronModule):
             alpha_bwd=alpha,
         )
 
-    def forward(self, hidden_states, per_token_scale=None, stashed_hs=None):
+    def forward(self, hidden_states, per_token_scale=None):
         """Perform the forward pass through the MLP block."""
         # [s, b, 4 * h/p]
         nvtx_range_push(suffix="linear_fc1")

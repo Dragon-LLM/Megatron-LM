@@ -70,8 +70,6 @@ class DragonConfig(ModelParallelConfig):
 
     num_first_mlp: int = 0
 
-    use_value_embeddings: bool = False
-
     layers_ve_config: str = '0000000'
 
     num_layers_in_first_pipeline_stage: Optional[int] = None
@@ -121,8 +119,6 @@ class DragonConfig(ModelParallelConfig):
 
     num_attention_heads: int = 0
     """Number of Dragon attention heads."""
-    
-    mamba3_fast: bool = True
 
     mixer_gn: bool = True
 
