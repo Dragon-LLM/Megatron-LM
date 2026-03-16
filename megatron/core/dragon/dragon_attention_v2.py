@@ -761,7 +761,7 @@ class DiffAttentionV2(MegatronModule, ABC):
             assert window_size is not None, "Window size must be provided for complete SLW."
             
             nvtx_range_push(suffix="complete_slw")
-            b, L = query.size(0), query.size(1)
+            L, b = query.size(0), query.size(1)
             
             wsize = window_size[0] if window_size is not None else 0
             window_boundaries = torch.arange(0, L + wsize, wsize, device=query.device, dtype=torch.int32)
