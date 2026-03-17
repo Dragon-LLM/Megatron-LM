@@ -1,8 +1,10 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
+import math
 from typing import Literal, Optional
 
 import torch
+import torch.nn.functional as F
 from torch import Tensor
 
 from megatron.core import tensor_parallel
@@ -126,6 +128,10 @@ class LanguageModelEmbedding(MegatronModule):
             embeddings = embeddings + tokentype_embedding
         else:
             assert self.tokentype_embeddings is None
+
+        # Normalize embeddings and scale by sqrt(hidden_size).
+        if self.config.normalize_embeddings:
+            embeddings = F.normalize(embeddings, dim=-1) * math.sqrt(self.config.hidden_size)
 
         # If the input flag for fp32 residual connection is set, convert for float.
         if self.config.fp32_residual_connection:

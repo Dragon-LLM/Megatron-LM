@@ -275,8 +275,14 @@ class TransformerConfig(ModelParallelConfig):
 
     embedding_init_method_std: Optional[float] = None
     """
-    Standard deviation of the zero mean normal for the default initialization method for the 
+    Standard deviation of the zero mean normal for the default initialization method for the
     embedding layer. If None, will be set to init_method_std.
+    """
+
+    normalize_embeddings: bool = False
+    """
+    If True, normalize the embedding output and scale by sqrt(hidden_size).
+    This applies L2 normalization along the last dimension followed by scaling.
     """
 
     init_model_with_meta_device: bool = False

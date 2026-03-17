@@ -1781,6 +1781,8 @@ def _add_dragon_args(parser):
     group.add_argument('--completedp-alpha', type=float, default=0.5)
     group.add_argument('--init-method-output-std', type=float, default=None)
     group.add_argument('--init-method-embedding-std', type=float, default=None)
+    group.add_argument('--normalize-embeddings', action='store_true',
+                       help='Normalize embedding output and scale by sqrt(hidden_size).')
     group.add_argument('--lr-emb', type=float, default=0.01)
     group.add_argument('--lr-scalar', type=float, default=0.01)
     group.add_argument('--lr-head', type=float, default=0.01)

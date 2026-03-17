@@ -298,6 +298,12 @@ class DragonConfig(ModelParallelConfig):
 
     init_method_embedding_std: Optional[float] = 1.
 
+    normalize_embeddings: bool = False
+    """
+    If True, normalize the embedding output and scale by sqrt(hidden_size).
+    This applies L2 normalization along the last dimension followed by scaling.
+    """
+
     init_model_with_meta_device: bool = False
     """
     If True, initializes the model with the meta device. This is helpful for
