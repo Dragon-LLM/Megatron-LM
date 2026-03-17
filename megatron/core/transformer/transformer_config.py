@@ -285,6 +285,13 @@ class TransformerConfig(ModelParallelConfig):
     This applies L2 normalization along the last dimension followed by scaling.
     """
 
+    normalize_lm_head: bool = False
+    """
+    If True, use cosine similarity with a learned temperature for the output logits.
+    Normalizes both hidden states and output layer weights before computing logits,
+    then scales by exp(temperature). The temperature is initialized to log(sqrt(hidden_size)).
+    """
+
     init_model_with_meta_device: bool = False
     """
     If True, initializes the model with the meta device. This is helpful for

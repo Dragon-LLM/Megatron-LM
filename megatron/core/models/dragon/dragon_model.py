@@ -5,6 +5,7 @@ from typing import Dict, Literal, Optional, Tuple
 import math
 
 import torch
+import torch.nn.functional as F
 from torch import Tensor
 
 from megatron.core import parallel_state, tensor_parallel
@@ -253,6 +254,15 @@ class DragonModel(LanguageModule):
                 uscaling_scaling=False,
             )
 
+            if config.normalize_lm_head:
+                assert not config.defer_embedding_wgrad_compute, (
+                    "normalize_lm_head bypasses the output layer forward, which is "
+                    "incompatible with defer_embedding_wgrad_compute."
+                )
+                self.temperature = torch.nn.Parameter(
+                    torch.tensor(math.log(math.sqrt(config.hidden_size)))
+                )
+
         if self.pre_process or self.post_process or self.mtp_process:
             self.setup_embeddings_and_output_layer()
 
@@ -264,6 +274,46 @@ class DragonModel(LanguageModule):
             if hasattr(module, 'finish_init'):
                 quant_config = get_quant_config_or_none(name, self.config.quant_recipe)
                 module.finish_init(quant_config)
+
+    def _compute_logits(self, hidden_states: Tensor) -> Tensor:
+        """Compute output logits, using cosine similarity if normalize_lm_head is enabled.
+
+        With normalize_lm_head, computes:
+            logits = exp(temperature) * (normalize(hidden) @ normalize(weight).T)
+
+        Handles sequence parallel (all-gather along seq dim) and tensor parallel
+        (all-gather along vocab dim when gather_output is set) to match the
+        behavior of the underlying TEColumnParallelLinear.
+
+        Args:
+            hidden_states: [s, b, h] (or [s/TP, b, h] when sequence parallel).
+
+        Returns:
+            Logits tensor.
+        """
+        if not self.config.normalize_lm_head:
+            logits, _ = self.output_layer(hidden_states)
+            return logits
+
+        # --- Sequence parallel: replicate what the output layer does internally ---
+        if getattr(self.output_layer, 'sequence_parallel', False) and self.output_layer.sequence_parallel:
+            hidden_states = gather_from_sequence_parallel_region(
+                hidden_states, group=self.pg_collection.tp
+            )
+
+        # Weight per TP rank is [vocab_size/TP, hidden_size]: each row is a complete
+        # embedding so per-row L2 normalization is correct without cross-rank communication.
+        x_norm = F.normalize(hidden_states, dim=-1)
+        w_norm = F.normalize(self.output_layer.weight, dim=-1)
+        logits = self.temperature.exp() * (x_norm @ w_norm.T)
+
+        # --- Tensor parallel: all-gather along vocab dim if needed ---
+        if not self.parallel_output:
+            logits = tensor_parallel.gather_from_tensor_model_parallel_region(
+                logits, group=self.pg_collection.tp
+            )
+
+        return logits
 
     def set_input_tensor(self, input_tensor: Tensor) -> None:
         """Sets input tensor to the model.
@@ -582,7 +632,7 @@ class DragonModel(LanguageModule):
                 loss_mask = torch.ones_like(mtp_labels)
             for mtp_layer_number in range(self.config.mtp_num_layers):
                 # output
-                mtp_logits, _ = self.output_layer(
+                mtp_logits = self._compute_logits(
                     hidden_states_list[mtp_layer_number + 1],
                 )
                 # Calc loss for the current Multi-Token Prediction (MTP) layers.
@@ -637,9 +687,7 @@ class DragonModel(LanguageModule):
                     hidden_states.squeeze(1).unsqueeze(0)
                 ).unsqueeze(1)
 
-        logits, _ = self.output_layer(
-            hidden_states,
-        )
+        logits = self._compute_logits(hidden_states)
 
         if just_logits:
             return logits
