@@ -328,23 +328,11 @@ class FastMamba3(MegatronModule):
         
         BCangle, _ = self.in_proj_dyn(normed_hidden_states)
 
-        if self.config.complete_slw:
-            assert window_size is not None, "window_size must be provided for complete SLW"
+        if self.config.artificial_seq_len > 0:
             seq_len, batch_size, dim = zxdtAtrap.shape
-            if window_size[0] < 1024:
-                #find the smallest divisor of seq_len that is greater than or equal to 1024
-                for w in range(1024, seq_len + 1):
-                    if seq_len % w == 0:
-                        lwindow_size = w
-                        break
-            else:
-                lwindow_size = window_size[0]
-            if lwindow_size != self.window_size:
-                #print(f"Updating Mamba3 window size to {lwindow_size} for complete SLW")
-                self.window_size = lwindow_size         
-            complete_slw_batch_size = int(batch_size * (seq_len // lwindow_size))
-            #print("Reshaping zxdtAtrap for complete SLW: ", zxdtAtrap.shape, "->", (lwindow_size, complete_slw_batch_size, dim))
-            zxdtAtrap = zxdtAtrap.reshape(lwindow_size, complete_slw_batch_size, dim)
+            artificial_batch_size = int(batch_size * (seq_len // self.config.artificial_seq_len))
+            #print("Reshaping zxdtAtrap for complete SLW: ", zxdtAtrap.shape, "->", (self.config.artificial_seq_len, artificial_batch_size, dim))
+            zxdtAtrap = zxdtAtrap.reshape(self.config.artificial_seq_len, artificial_batch_size, dim)
 
         per_head = zxdtAtrap.view(*zxdtAtrap.shape[:-1], self.nheads_local_tp, 2*self.headdim+3)
         off = 0
@@ -381,11 +369,11 @@ class FastMamba3(MegatronModule):
             C = gather_from_sequence_parallel_region(C, group=self.pg_collection.tp)
             angle = gather_from_sequence_parallel_region(angle, group=self.pg_collection.tp)
 
-        if self.config.complete_slw:
-            #print("Reshaping B and C back for complete SLW: ", B.shape, "->", (lwindow_size, complete_slw_batch_size, *B.shape[2:]), " and ", C.shape, "->", (lwindow_size, complete_slw_batch_size, *C.shape[2:]))
-            B = B.reshape(lwindow_size, complete_slw_batch_size, *B.shape[2:])
-            C = C.reshape(lwindow_size, complete_slw_batch_size, *C.shape[2:])
-            angle = angle.reshape(lwindow_size, complete_slw_batch_size, *angle.shape[2:])
+        if self.config.artificial_seq_len > 0:
+            #print("Reshaping B and C back for complete SLW: ", B.shape, "->", (self.config.artificial_seq_len, artificial_batch_size, *B.shape[2:]), " and ", C.shape, "->", (self.config.artificial_seq_len, artificial_batch_size, *C.shape[2:]))
+            B = B.reshape(self.config.artificial_seq_len, artificial_batch_size, *B.shape[2:])
+            C = C.reshape(self.config.artificial_seq_len, artificial_batch_size, *C.shape[2:])
+            angle = angle.reshape(self.config.artificial_seq_len, artificial_batch_size, *angle.shape[2:])
 
         B = rearrange(B, "l b r G n -> b l r G n").contiguous()
         C = rearrange(C, "l b r G n -> b l r G n").contiguous()
@@ -427,7 +415,7 @@ class FastMamba3(MegatronModule):
 
         y = self.output_norm(y)
 
-        if self.config.complete_slw:
+        if self.config.artificial_seq_len > 0:
             y = y.reshape(seq_len, batch_size, -1)
 
         return y, normed_hidden_states

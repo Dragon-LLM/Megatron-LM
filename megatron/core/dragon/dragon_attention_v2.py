@@ -756,15 +756,15 @@ class DiffAttentionV2(MegatronModule, ABC):
         # =====================
         # complete slw
         # =====================
-        if self.config.complete_slw:
+        if self.config.artificial_seq_len > 0:
             assert packed_seq_params is not None, "Packed sequence parameters must be provided for complete SLW."
             assert window_size is not None, "Window size must be provided for complete SLW."
             
-            nvtx_range_push(suffix="complete_slw")
+            nvtx_range_push(suffix="artificial_seq_len")
             L, b = query.size(0), query.size(1)
             
             wsize = window_size[0] if window_size is not None else 0
-            window_boundaries = torch.arange(0, L + wsize, wsize, device=query.device, dtype=torch.int32)
+            window_boundaries = torch.arange(0, L + wsize, self.config.artificial_seq_len, device=query.device, dtype=torch.int32)
             window_boundaries = torch.unique(torch.clamp(window_boundaries, max=L))
             # case where intra doc masking is off, but we don't want to plan this for now
             #if cu_seqlens is None or max_seqlen is None:
@@ -792,7 +792,7 @@ class DiffAttentionV2(MegatronModule, ABC):
             packed_seq_params.position_ids = (seq_range - chunk_starts).unsqueeze(0).expand(b, -1)
 
 
-            nvtx_range_pop(suffix="complete_slw")
+            nvtx_range_pop(suffix="artificial_seq_len")
 
         # =====================
         # kv shift

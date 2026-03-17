@@ -1257,9 +1257,9 @@ def validate_args(args, defaults={}):
             args.recompute_granularity != 'full'
         ), 'recompute_granularity must not be full when CUDA Graphs are enabled.'
 
-    if args.complete_slw:
-        assert args.training_sequence_length % args.slw_end == 0, "For complete SLW, sequence length must be divisible by the SLW end window size."
-        assert args.micro_batch_size == 1, "Complete SLW only supports micro batch size of 1."
+    if args.artificial_seq_len:
+        assert args.training_sequence_length % args.artificial_seq_len == 0, "For artificial sequence length, sequence length must be divisible by the artificial sequence length."
+        assert args.micro_batch_size == 1, "artificial_seq_len only supports micro batch size of 1."
 
     # Print arguments.
     _print_args("arguments", args)
@@ -1764,7 +1764,7 @@ def _add_dragon_args(parser):
     group.add_argument('--slw-start', type=int, default=0)
     group.add_argument('--slw-end', type=int, default=0)
     group.add_argument('--slw-increment', type=int, default=0)
-    group.add_argument('--complete-slw', action='store_true')
+    group.add_argument('--artificial-seq-len', type=int, default=0)
     group.add_argument('--moe-router-type', type=str, default="classic")
     group.add_argument("--no-mixer-gn", dest="mixer_gn", action="store_false")
     group.add_argument('--reset-training', action='store_true')

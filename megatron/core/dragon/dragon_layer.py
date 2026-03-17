@@ -220,6 +220,9 @@ class DragonGeodesicNorm(nn.Module):
         """
 
         gradient = g - (x * g).sum(dim=-1,keepdim=True) / (torch.norm(x, p=2, dim=-1, keepdim=True) ** 2) * x
+        x_norm_sq = x.square().sum(dim=-1, keepdim=True).clamp_min(1e-12)
+        proj_coeff = (x * g).sum(dim=-1, keepdim=True) / x_norm_sq
+        gradient = g - proj_coeff * x
         tangent_norm = torch.norm(gradient, p=2, dim=-1, keepdim=True)
         safe_tangent_norm = torch.clamp(tangent_norm, min=1e-8)
         unit_tangent = gradient / safe_tangent_norm

@@ -216,8 +216,8 @@ class DragonConfig(ModelParallelConfig):
     """If not None, then will use sliding window attention. The size of the window is specified by
     the numbers inside the tuple; -1 is special value meaning "infinite window size"."""
 
-    complete_slw: bool = False
-    """Whether to use window size on all mixer layers"""
+    artificial_seq_len: int = 0
+    """Artificial sequence length to use for all mixer layers."""
 
     window_attn_skip_freq: Optional[Union[int, List[int]]] = None
     """Frequency of full attention layers among sliding window attention layers. Accepts either:
