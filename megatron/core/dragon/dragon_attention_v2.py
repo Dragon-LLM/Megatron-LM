@@ -776,7 +776,7 @@ class DiffAttentionV2(MegatronModule, ABC):
             # torch.unique automatically removes duplicates and sorts them in ascending order
             packed_seq_params.cu_seqlens_q = torch.unique(combined, sorted=True)
             packed_seq_params.cu_seqlens_kv = packed_seq_params.cu_seqlens_q
-            packed_seq_params.max_seqlen_q = min(packed_seq_params.max_seqlen_q, wsize) if wsize > 0 else packed_seq_params.max_seqlen_q
+            packed_seq_params.max_seqlen_q = min(packed_seq_params.max_seqlen_q, self.config.artificial_seq_len)
             packed_seq_params.max_seqlen_kv = packed_seq_params.max_seqlen_q
             boundaries_1d = packed_seq_params.cu_seqlens_q
 

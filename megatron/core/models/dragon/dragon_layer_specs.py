@@ -189,7 +189,7 @@ def get_dragon_block_spec(
     
     dragon_block_spec = DragonBlockSubmodules(
         layer_specs=[layer] * num_layers,
-        final_layer_norm=TENorm,
+        final_layer_norm=IdentityOp, #TENorm if not config.normalize_lm_head else IdentityOp,
     )
 
     return dragon_block_spec
