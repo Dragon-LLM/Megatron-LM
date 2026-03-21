@@ -131,7 +131,7 @@ class LanguageModelEmbedding(MegatronModule):
 
         # Normalize embeddings and scale by sqrt(hidden_size).
         if self.config.normalize_embeddings:
-            embeddings = F.normalize(embeddings, dim=-1) * math.sqrt(self.config.hidden_size)
+            embeddings = F.normalize(embeddings, dim=-1)
 
         # If the input flag for fp32 residual connection is set, convert for float.
         if self.config.fp32_residual_connection:

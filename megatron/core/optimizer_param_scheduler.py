@@ -267,6 +267,7 @@ class OptimizerParamScheduler:
                 param_group['betas'] = (self.beta1, self.beta2, self.get_beta3())
             else:
                 param_group['betas'] = (self.beta1, self.beta2)
+            """
             if self.use_completedp:
                 if self.ademamix:
                     param_group['betas'] = (
@@ -284,7 +285,8 @@ class OptimizerParamScheduler:
                         1 - (1 - self.beta1) * self.rhosq_adjusted,
                         1 - (1 - self.beta2) * self.rhosq_adjusted
                     )
-                param_group['eps'] = param_group['eps']
+                """
+            param_group['eps'] = param_group['eps']
 
     def state_dict(self) -> dict:
         """Return the state dict."""
