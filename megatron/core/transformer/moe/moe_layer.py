@@ -16,6 +16,7 @@ from megatron.core.transformer.moe.moe_utils import (
     maybe_skip_or_early_return_by_cudagraph,
 )
 from megatron.core.transformer.moe.router import TopKRouter
+from megatron.core.transformer.moe.shared_experts import set_tensor_grad_fn_sequence_sr
 from megatron.core.transformer.moe.token_dispatcher import (
     MoEAllGatherTokenDispatcher,
     MoEAlltoAllTokenDispatcher,
@@ -376,6 +377,15 @@ class MoELayer(BaseMoELayer):
             output = self.combine(output)
             if has_latent_moe:
                 output, _ = self.up_proj(output)
+                if self.shared_expert_overlap and self.use_shared_expert:
+                    # Propagate high backward priority through up_proj so that the
+                    # routed path backward (AlltoAll) still runs before the shared
+                    # expert backward. Without this, up_proj breaks the sequence_nr
+                    # chain set in the dispatcher, and the shared expert backward
+                    # could run first, reordering TP-group NCCL collectives.
+                    set_tensor_grad_fn_sequence_sr(
+                        output, torch.iinfo(torch.int).max
+                    )
             # For non-overlap: shared_expert_output was computed upfront.
             # For overlap without latent-MoE: dispatcher already added shared output.
             # For overlap with latent-MoE: dispatcher deferred; retrieve and add here
