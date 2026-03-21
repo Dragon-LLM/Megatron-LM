@@ -67,7 +67,6 @@ class MoETokenDispatcher:
         """
         self.config = config
         self.shared_experts: Optional[SharedExpertMLP] = None
-        self.defer_shared_expert_output = False
 
         self.ep_group = pg_collection.ep
         # use pg_collection.expt_tp_group as tensor parallel group in this module.
@@ -85,11 +84,7 @@ class MoETokenDispatcher:
 
     @abstractmethod
     def dispatch_preprocess(
-        self,
-        tokens: torch.Tensor,
-        routing_map: torch.Tensor,
-        probs: torch.Tensor,
-        shared_expert_input: Optional[torch.Tensor] = None,
+        self, tokens: torch.Tensor, routing_map: torch.Tensor, probs: torch.Tensor
     ):
         """Prepares tokens for dispatch without inter-device communication.
 
@@ -105,9 +100,6 @@ class MoETokenDispatcher:
             tokens (torch.Tensor): Input tokens.
             routing_map (torch.Tensor): Token to expert mapping tensor.
             probs (torch.Tensor): The routing probability tensor, [num_tokens, num_experts].
-            shared_expert_input (torch.Tensor, optional): Original (pre-compression) hidden
-                states for shared expert overlap when using latent-MoE. If provided, this
-                tensor is used for shared expert computation instead of the (compressed) tokens.
 
         Returns:
             A tuple of preprocessed tokens and probabilities.
@@ -207,19 +199,10 @@ class MoETokenDispatcher:
         """
         raise NotImplementedError("combine_postprocess function not implemented.")
 
-    def set_shared_experts(self, shared_experts, defer_output=False):
-        """Set shared expert to the dispatcher.
-
-        Args:
-            shared_experts: The shared expert module.
-            defer_output (bool): If True, the dispatcher will not add the shared expert
-                output in combine_postprocess. The caller (MoELayer) is responsible for
-                retrieving the output via shared_experts.get_output() and adding it.
-                This is needed for latent-MoE where the addition must happen after up_proj.
-        """
+    def set_shared_experts(self, shared_experts):
+        """Set shared expert to the dispatcher."""
         assert self.config.moe_shared_expert_overlap
         self.shared_experts = shared_experts
-        self.defer_shared_expert_output = defer_output
 
     def get_align_size_for_quantization(self):
         """Get the alignment size for quantization."""
@@ -269,11 +252,7 @@ class MoEAllGatherTokenDispatcher(MoETokenDispatcher):
         self.cudagraph_attrs = ['routing_map']
 
     def dispatch_preprocess(
-        self,
-        hidden_states: torch.Tensor,
-        routing_map: torch.Tensor,
-        probs: torch.Tensor,
-        shared_expert_input: Optional[torch.Tensor] = None,
+        self, hidden_states: torch.Tensor, routing_map: torch.Tensor, probs: torch.Tensor
     ):
         """Reshapes hidden states and caches the routing map."""
         self.hidden_shape = hidden_states.shape
@@ -489,9 +468,9 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
 
         self.shared_experts = None
 
-    def set_shared_experts(self, shared_experts, defer_output=False):
+    def set_shared_experts(self, shared_experts):
         """Set shared expert to the dispatcher."""
-        super().set_shared_experts(shared_experts, defer_output=defer_output)
+        super().set_shared_experts(shared_experts)
         if shared_experts.use_shared_expert_gate:
             self.cudagraph_attrs.append('shared_experts.gate_score')
         self.cudagraph_attrs.append('shared_experts.cached_fc1_input')
@@ -620,11 +599,7 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         return num_tokens_per_local_expert
 
     def dispatch_preprocess(
-        self,
-        hidden_states: torch.Tensor,
-        routing_map: torch.Tensor,
-        probs: torch.Tensor,
-        shared_expert_input: Optional[torch.Tensor] = None,
+        self, hidden_states: torch.Tensor, routing_map: torch.Tensor, probs: torch.Tensor
     ):
         """Prepares hidden states and probabilities for dispatch.
 
@@ -635,9 +610,6 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             hidden_states (torch.Tensor): Input token embeddings.
             routing_map (torch.Tensor): The mapping of tokens to experts.
             probs (torch.Tensor): Routing probabilities.
-            shared_expert_input (torch.Tensor, optional): Original (pre-compression) hidden
-                states for shared expert overlap when using latent-MoE. If provided, this
-                tensor is used for shared expert pre_forward_comm instead of hidden_states.
 
         Returns:
             A tuple of permuted hidden states and probabilities.
@@ -660,12 +632,7 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         self.tokens_per_expert = self.preprocess(self.routing_map)
 
         if self.shared_experts is not None:
-            # When latent-MoE is used, shared_expert_input provides the original
-            # (pre-compression) hidden states for the shared expert computation.
-            if shared_expert_input is not None:
-                self.shared_experts.pre_forward_comm(shared_expert_input)
-            else:
-                self.shared_experts.pre_forward_comm(hidden_states.view(self.hidden_shape))
+            self.shared_experts.pre_forward_comm(hidden_states.view(self.hidden_shape))
 
         # Permutation 1: input to AlltoAll input
         self.tokens_per_expert = self._maybe_dtoh_and_synchronize(
@@ -887,8 +854,8 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         else:
             output = output.view(self.hidden_shape)
 
-        # Add shared experts output (unless deferred for latent-MoE)
-        if self.shared_experts is not None and not self.defer_shared_expert_output:
+        # Add shared experts output
+        if self.shared_experts is not None:
             shared_expert_output = self.shared_experts.get_output()
             output += shared_expert_output
         return output
@@ -1462,11 +1429,7 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
 
     @jit_fuser
     def dispatch_preprocess(
-        self,
-        hidden_states: torch.Tensor,
-        routing_map: torch.Tensor,
-        probs: torch.Tensor,
-        shared_expert_input: Optional[torch.Tensor] = None,
+        self, hidden_states: torch.Tensor, routing_map: torch.Tensor, probs: torch.Tensor
     ):
         """Initializes routing metadata and prepares tensors for fused dispatch.
 
@@ -1478,7 +1441,6 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
             hidden_states (torch.Tensor): Input hidden states to be processed
             routing_map (torch.Tensor): Map indicating which expert each token should be routed to
             probs (torch.Tensor): Routing probabilities for each token-expert pair
-            shared_expert_input (torch.Tensor, optional): Unused, for interface compatibility.
 
         Returns:
             A tuple of reshaped hidden states and token probabilities.

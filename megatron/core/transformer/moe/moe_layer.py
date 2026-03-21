@@ -16,7 +16,6 @@ from megatron.core.transformer.moe.moe_utils import (
     maybe_skip_or_early_return_by_cudagraph,
 )
 from megatron.core.transformer.moe.router import TopKRouter
-from megatron.core.transformer.moe.shared_experts import set_tensor_grad_fn_sequence_sr
 from megatron.core.transformer.moe.token_dispatcher import (
     MoEAllGatherTokenDispatcher,
     MoEAlltoAllTokenDispatcher,
@@ -204,16 +203,18 @@ class MoELayer(BaseMoELayer):
                 input_scalar=input_scalar,
             )
             if self.shared_expert_overlap:
-                # When latent-MoE is used, shared experts operate on the full hidden
-                # dimension while routed experts operate on the compressed dimension.
-                # Defer adding the shared expert output so the MoE layer can add it
-                # after up_proj restores the full dimension.
                 has_latent_moe = (
                     hasattr(config, "moe_routed_input_dim") and config.moe_routed_input_dim
                 )
-                self.token_dispatcher.set_shared_experts(
-                    self.shared_experts, defer_output=has_latent_moe
-                )
+                if has_latent_moe:
+                    # For latent-MoE, the shared experts operate on the full hidden
+                    # dimension while routed experts operate on the compressed dimension.
+                    # Manage the overlap directly from the MoE layer forward instead
+                    # of the dispatcher to avoid cross-branch sequence_nr manipulation
+                    # that disrupts the grouped GEMM backward.
+                    pass
+                else:
+                    self.token_dispatcher.set_shared_experts(self.shared_experts)
 
         # Cudagraph tensor store for resuming the forward pass from the end of the cudagraph.
         self.cudagraph_tensor_store = MoECudaGraphTensorStore()
@@ -230,28 +231,16 @@ class MoELayer(BaseMoELayer):
 
     @maybe_skip_or_early_return_by_cudagraph("preprocess")
     def preprocess(
-        self,
-        hidden_states: torch.Tensor,
-        probs: torch.Tensor,
-        routing_map: torch.Tensor,
-        shared_expert_input: Optional[torch.Tensor] = None,
+        self, hidden_states: torch.Tensor, probs: torch.Tensor, routing_map: torch.Tensor
     ):
         """Preprocess token routing for dispatch.
 
         This method preprocesses the hidden states and routing probabilities for the token
         dispatcher. The original hidden states are returned as a residual connection.
-
-        Args:
-            hidden_states: Input hidden states (possibly compressed for latent-MoE).
-            probs: Routing probabilities.
-            routing_map: Token-to-expert mapping.
-            shared_expert_input: Original (pre-compression) hidden states for shared
-                expert overlap with latent-MoE. Passed to the dispatcher so shared
-                experts receive the full-dimension input.
         """
         residual = hidden_states
         hidden_states, probs = self.token_dispatcher.dispatch_preprocess(
-            hidden_states, routing_map, probs, shared_expert_input=shared_expert_input
+            hidden_states, routing_map, probs
         )
         return hidden_states, probs, residual
 
@@ -348,21 +337,25 @@ class MoELayer(BaseMoELayer):
                 hasattr(self.config, "moe_routed_input_dim")
                 and self.config.moe_routed_input_dim
             )
+            latent_overlap = (
+                has_latent_moe and self.shared_expert_overlap and self.use_shared_expert
+            )
             try:
                 shared_expert_output = self.shared_experts_compute(hidden_states)
                 probs, routing_map, top_indices = self.route(hidden_states)
-                # For latent-MoE with shared expert overlap, save the original
-                # (full-dimension) hidden states for the shared experts before
-                # compressing via down_proj. The dispatcher will use this for
-                # pre_forward_comm instead of the compressed hidden states.
-                shared_expert_input = None
-                if has_latent_moe and self.shared_expert_overlap:
-                    shared_expert_input = hidden_states
+
+                # For latent-MoE with overlap, start the shared expert computation
+                # on the side stream using the full-dimension hidden states BEFORE
+                # compressing via down_proj. The overlap stages are managed here
+                # instead of in the dispatcher to avoid cross-branch sequence_nr
+                # manipulation that disrupts the grouped GEMM backward.
+                if latent_overlap:
+                    self.shared_experts.pre_forward_comm(hidden_states)
+
                 if has_latent_moe:
                     hidden_states, _ = self.down_proj(hidden_states)
                 hidden_states, probs, residual = self.preprocess(
                     hidden_states, probs, routing_map,
-                    shared_expert_input=shared_expert_input,
                 )
             except MoECudaGraphPartialCaptureSignal as e:
                 # This signal is raised from the maybe_skip_or_early_return_by_cudagraph decorator.
@@ -372,28 +365,35 @@ class MoELayer(BaseMoELayer):
                 # We need to return the intermediate tensors as CUDA graph outputs.
                 return e.get_early_return_outputs(hidden_states, shared_expert_output)
 
+            # Shared expert FC1 overlaps with dispatch AlltoAll
+            if latent_overlap:
+                self.shared_experts.linear_fc1_forward_and_act()
+
             dispatched_input, probs = self.dispatch(hidden_states, probs)
             output, mlp_bias = self.routed_experts_compute(dispatched_input, probs, residual)
+
+            # Shared expert FC2 overlaps with combine AlltoAll
+            if latent_overlap:
+                self.shared_experts.linear_fc2_forward()
+
             output = self.combine(output)
+
+            # Shared expert ReduceScatter overlaps with up_proj
+            if latent_overlap:
+                self.shared_experts.post_forward_comm()
+
             if has_latent_moe:
                 output, _ = self.up_proj(output)
-                if self.shared_expert_overlap and self.use_shared_expert:
-                    # Propagate high backward priority through up_proj so that the
-                    # routed path backward (AlltoAll) still runs before the shared
-                    # expert backward. Without this, up_proj breaks the sequence_nr
-                    # chain set in the dispatcher, and the shared expert backward
-                    # could run first, reordering TP-group NCCL collectives.
-                    set_tensor_grad_fn_sequence_sr(
-                        output, torch.iinfo(torch.int).max
-                    )
+
             # For non-overlap: shared_expert_output was computed upfront.
             # For overlap without latent-MoE: dispatcher already added shared output.
-            # For overlap with latent-MoE: dispatcher deferred; retrieve and add here
-            # after up_proj restores the full dimension.
             if shared_expert_output is not None:
                 output = output + shared_expert_output
-            if has_latent_moe and self.shared_expert_overlap and self.use_shared_expert:
+            # For latent-MoE overlap: sync streams and add shared expert output
+            # after up_proj restores the full dimension.
+            if latent_overlap:
                 output = output + self.shared_experts.get_output()
+
             return output, mlp_bias, routing_map, top_indices
 
         if self.moe_layer_recompute:
