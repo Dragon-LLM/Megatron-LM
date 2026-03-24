@@ -2140,11 +2140,11 @@ def save_checkpoint_and_time(
         train_data_iterator=train_data_iterator,
         preprocess_common_state_dict_fn=preprocess_common_state_dict,
     )
-    if args.fp8:
-        # Run garbage collection after checkpoint saving to free memory from
-        # dequantized bf16 tensors that were temporarily created during fp8
-        # model checkpoint saving.
-        gc.collect()
+    # Run garbage collection after checkpoint saving to free memory from
+    # temporary tensors created during checkpoint saving (state_dict copies,
+    # NCCL communication buffers, .contiguous() copies of TP-sharded tensors).
+    gc.collect()
+    torch.cuda.empty_cache()
     if should_disable_forward_pre_hook(args):
         enable_forward_pre_hook(model)
     timers(timer_key).stop(barrier=True)
