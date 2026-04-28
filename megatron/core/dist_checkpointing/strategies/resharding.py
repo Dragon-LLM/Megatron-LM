@@ -54,7 +54,7 @@ class TensorReformulationMetadata:
     ckpt_reform_global_shape: Tuple[int, ...]
 
     def __post_init__(self):
-        assert self.ckpt_orig_global_shape
+        assert self.ckpt_orig_global_shape is not None
 
 
 def nd_flattened_tensor_reformulated_global_shape(sh_ten: ShardedTensor) -> Tuple[int, ...]:

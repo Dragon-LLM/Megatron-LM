@@ -303,6 +303,11 @@ def _update_router_expert_bias(model: List[torch.nn.Module], config: Transformer
         for module in get_attr_wrapped_model(model_chunk, 'modules')():
             if hasattr(module, 'expert_bias'):
                 module.local_tokens_per_expert2 = module.local_tokens_per_expert.clone()
+                # TEMP
+                torch.distributed.all_reduce(
+                    module.local_tokens_per_expert2,
+                    group=parallel_state.get_tensor_and_data_parallel_group(with_context_parallel=True),
+                )
                 tokens_per_expert_list.append(module.local_tokens_per_expert)
                 expert_bias_list.append(module.expert_bias)
                 router_modules.append(module)

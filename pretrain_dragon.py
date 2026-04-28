@@ -43,6 +43,15 @@ except ImportError:
 stimer = StragglerDetector()
 g_scheduler = {'scheduler': None}
 
+import traceback, pickle
+import torch
+old_wrap = torch.distributed.checkpoint.utils._wrap_exception                                                                                                                        
+def patched_wrap(exc):
+    traceback.print_exception(exc)  # Print the REAL error                                                                                                                           
+    exc.__traceback__ = None        # Strip traceback so pickle works                                                                                                                
+    return old_wrap(exc)                                                                                                                                                             
+torch.distributed.checkpoint.utils._wrap_exception = patched_wrap                                                                                                                    
+
 
 def get_batch(data_iterator, vp_stage: Optional[int] = None):
     """Generate a batch."""

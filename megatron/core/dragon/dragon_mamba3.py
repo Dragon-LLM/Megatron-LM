@@ -31,21 +31,25 @@ from megatron.core.transformer.utils import (
 )
 from megatron.core.utils import deprecate_inference_params, log_single_rank, make_tp_sharded_tensor_for_checkpoint, nvtx_range_pop, nvtx_range_push
 
-
-try:
-    from mamba_ssm.ops.triton.layernorm_gated import RMSNorm as RMSNormGated
-
-    HAVE_MAMBA_SSM = True
-except ImportError:
-    HAVE_MAMBA_SSM = False
-
+HAVE_FAST_MAMBA_SSM = False
 try:
     from dragon_mamba3_fast.fused_mimo_variant.mamba3_tilelang import mamba3_tilelang
     from dragon_mamba3_fast.angle_cumsum import angle_dt
     HAVE_FAST_MAMBA_SSM = True
-except ImportError as e:
-    HAVE_FAST_MAMBA_SSM = True
-    raise e
+except ImportError as exc:
+    if not HAVE_FAST_MAMBA_SSM:
+        try:
+            from dragon_mamba3_ops.fused_mimo_variant.mamba3_tilelang import mamba3_tilelang
+            from dragon_mamba3_ops.angle_cumsum import angle_dt
+            HAVE_FAST_MAMBA_SSM = True
+
+        except ImportError as e:
+            HAVE_FAST_MAMBA_SSM = False
+            pass
+    if not HAVE_FAST_MAMBA_SSM:
+        raise exc
+
+
 
 logger = logging.getLogger(__name__)
 
@@ -71,7 +75,7 @@ class FastMamba3(MegatronModule):
         input_scalar: float = 1.,
         pg_collection: ProcessGroupCollection = None,
     ):
-        if not HAVE_MAMBA_SSM:
+        if not HAVE_FAST_MAMBA_SSM:
             raise ImportError(
                 "MambaSSM is not installed. Please install it with `pip install mamba-ssm`."
             )
@@ -408,7 +412,10 @@ class FastMamba3(MegatronModule):
             chunk_size=self.chunk_size,
             rotary_dim_divisor=self.rotary_dim_divisor,
             dtype=x.dtype,
+            return_state=False,
         )
+        if isinstance(y, tuple):
+            y, new_state = y
         nvtx_range_pop(suffix="M3_mimo_chunk_scan")
 
         y = rearrange(y, "b l h p -> l b (h p)")
