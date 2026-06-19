@@ -31,24 +31,66 @@ from megatron.core.transformer.utils import (
 )
 from megatron.core.utils import deprecate_inference_params, log_single_rank, make_tp_sharded_tensor_for_checkpoint, nvtx_range_pop, nvtx_range_push
 
+# Public state-spaces/mamba Mamba-3 MIMO kernel, used WITH cu_seqlens so the SSM
+# state resets at artificial_seq_len window boundaries AND document boundaries
+# (packed-sequence isolation). It takes RAW angles (computes the angle cumsum
+# internally), so we no longer call angle_dt externally.
+#
+# PERF: the public wrappers ship with T.dynamic("B/S/H/G/NS") which compiles a
+# shape-generic kernel ~10-20x slower on GH200. We patched mamba3_mimo_{fwd,bwd}
+# {,_varlen}.py to pass CONCRETE shapes -> @tilelang.jit specializes+caches one
+# kernel per shape (verified: varlen B=1 S=32768 NS=2 == 9ms, == private speed).
 HAVE_FAST_MAMBA_SSM = False
 try:
-    from dragon_mamba3_fast.fused_mimo_variant.mamba3_tilelang import mamba3_tilelang
-    from dragon_mamba3_fast.angle_cumsum import angle_dt
+    from mamba_ssm.ops.tilelang.mamba3.mamba3_mimo import mamba3_mimo
     HAVE_FAST_MAMBA_SSM = True
 except ImportError as exc:
-    if not HAVE_FAST_MAMBA_SSM:
-        try:
-            from dragon_mamba3_ops.fused_mimo_variant.mamba3_tilelang import mamba3_tilelang
-            from dragon_mamba3_ops.angle_cumsum import angle_dt
-            HAVE_FAST_MAMBA_SSM = True
+    HAVE_FAST_MAMBA_SSM = False
+    raise exc
 
-        except ImportError as e:
-            HAVE_FAST_MAMBA_SSM = False
-            pass
-    if not HAVE_FAST_MAMBA_SSM:
-        raise exc
+# Silence the per-call TileLang kernel-cache WARNING (fires on every fwd/bwd,
+# floods logs at 1024 ranks; it is a cache HIT, not a recompile).
+try:
+    import tilelang as _tilelang
+    _tilelang.set_log_level("ERROR")
+except Exception:
+    import logging as _logging
+    _logging.getLogger("tilelang").setLevel(_logging.ERROR)
 
+
+def _canon_strides(t):
+    """Force canonical C-contiguous strides.
+
+    torch's .contiguous() leaves a size-1 leading dim with a collapsed stride
+    (a contiguous (1, L, H, P) tensor can report stride[0]==H*P instead of L*H*P).
+    The TileLang MIMO kernel validates strides strictly and rejects this at micro
+    batch size 1 (the cu_seqlens / B=1 case). as_strided fixes it without a copy.
+    """
+    t = t.contiguous()
+    shape = t.shape
+    strides, acc = [], 1
+    for s in reversed(shape):
+        strides.append(acc)
+        acc *= s
+    return t.as_strided(shape, tuple(reversed(strides)))
+
+
+class _CanonGradStrides(torch.autograd.Function):
+    """Identity fwd; canonicalize the gradient's strides in bwd.
+
+    The varlen MIMO backward validates DOUT (grad-of-output) strides just as
+    strictly as the forward validates inputs. At B=1 the downstream rearrange
+    hands back a grad whose size-1 leading dim has a collapsed stride that
+    .contiguous() does not fix; this restores canonical strides for the kernel.
+    """
+
+    @staticmethod
+    def forward(ctx, x):
+        return x
+
+    @staticmethod
+    def backward(ctx, grad):
+        return _canon_strides(grad)
 
 
 logger = logging.getLogger(__name__)
@@ -332,12 +374,9 @@ class FastMamba3(MegatronModule):
         
         BCangle, _ = self.in_proj_dyn(normed_hidden_states)
 
-        if self.config.artificial_seq_len > 0:
-            seq_len, batch_size, dim = zxdtAtrap.shape
-            artificial_batch_size = int(batch_size * (seq_len // self.config.artificial_seq_len))
-            #print("Reshaping zxdtAtrap for complete SLW: ", zxdtAtrap.shape, "->", (self.config.artificial_seq_len, artificial_batch_size, dim))
-            zxdtAtrap = zxdtAtrap.reshape(self.config.artificial_seq_len, artificial_batch_size, dim)
-
+        # Window/document resets are handled by cu_seqlens passed to the kernel
+        # (built below), NOT by folding windows into the batch dim. The kernel runs
+        # at B=1 with the full sequence; the static-shape patch keeps it fast.
         per_head = zxdtAtrap.view(*zxdtAtrap.shape[:-1], self.nheads_local_tp, 2*self.headdim+3)
         off = 0
         z    = per_head[..., off : off + self.headdim];   off += self.headdim # (L, B, H, p)
@@ -373,57 +412,67 @@ class FastMamba3(MegatronModule):
             C = gather_from_sequence_parallel_region(C, group=self.pg_collection.tp)
             angle = gather_from_sequence_parallel_region(angle, group=self.pg_collection.tp)
 
-        if self.config.artificial_seq_len > 0:
-            #print("Reshaping B and C back for complete SLW: ", B.shape, "->", (self.config.artificial_seq_len, artificial_batch_size, *B.shape[2:]), " and ", C.shape, "->", (self.config.artificial_seq_len, artificial_batch_size, *C.shape[2:]))
-            B = B.reshape(self.config.artificial_seq_len, artificial_batch_size, *B.shape[2:])
-            C = C.reshape(self.config.artificial_seq_len, artificial_batch_size, *C.shape[2:])
-            angle = angle.reshape(self.config.artificial_seq_len, artificial_batch_size, *angle.shape[2:])
-
-        B = rearrange(B, "l b r G n -> b l r G n").contiguous()
-        C = rearrange(C, "l b r G n -> b l r G n").contiguous()
-        a, b, c, d, e = C.size()
-        C = C.as_strided(size=(a, b, c, d, e), stride=(b*c*d*e, c*d*e, d*e, e, 1))
-        a, b, c, d, e = B.size()
-        B = B.as_strided(size=(a, b, c, d, e), stride=(b*c*d*e, c*d*e, d*e, e, 1))
+        B = _canon_strides(rearrange(B, "l b r G n -> b l r G n"))
+        C = _canon_strides(rearrange(C, "l b r G n -> b l r G n"))
         nvtx_range_pop(suffix="M3_mimo_BC_norm")
 
-        angle = angle.transpose(0, 1) # (B, L, S) 
-        angle = angle.unsqueeze(-2).expand(-1, -1, self.nheads_local_tp, -1) # (B, L, G, S)
-        angle = angle_dt(angle, dt)
+        # Public kernel applies the angle cumsum internally (varlen-aware), so we
+        # pass RAW angles (no external angle_dt).
+        angle = angle.transpose(0, 1) # (B, L, S)
+        angle = angle.unsqueeze(-2).expand(-1, -1, self.nheads_local_tp, -1).contiguous() # (B, L, H, S)
 
         ADT = rearrange(ADT, "b l n -> b n l")
         dt = rearrange(dt, "b l n -> b n l")
 
-        y = mamba3_tilelang(
-            Q=C.contiguous(),
-            K=B.contiguous(),
-            V=x.contiguous(),
-            ADT=ADT.to(torch.float32).contiguous(),
-            DT=dt.to(torch.float32).contiguous(),
-            Trap=trap.contiguous(),
+        # cu_seqlens: reset the SSM state at artificial_seq_len window boundaries
+        # AND document boundaries (packed-sequence isolation). This replaces the
+        # old reshape-into-batch "complete SLW".
+        b_size, L = x.shape[0], x.shape[1]
+        cu_seqlens = None
+        if packed_seq_params is not None and getattr(packed_seq_params, "cu_seqlens_q", None) is not None:
+            cu_seqlens = packed_seq_params.cu_seqlens_q.to(torch.int32)
+        if self.config.artificial_seq_len > 0:
+            window_boundaries = torch.arange(
+                0, L + 1, self.config.artificial_seq_len,
+                device=x.device, dtype=torch.int32,
+            )
+            cu_seqlens = window_boundaries if cu_seqlens is None else \
+                torch.unique(torch.cat([window_boundaries, cu_seqlens]), sorted=True)
+        assert cu_seqlens is None or b_size == 1, (
+            "Mamba-3 cu_seqlens path requires micro batch size 1 at the kernel "
+            f"(got batch={b_size}); pack sequences instead of batching."
+        )
+
+        y = mamba3_mimo(
+            Q=_canon_strides(C),
+            K=_canon_strides(B),
+            V=_canon_strides(x),
+            ADT=_canon_strides(ADT.to(torch.float32)),
+            DT=_canon_strides(dt.to(torch.float32)),
+            Trap=_canon_strides(trap),
             Q_bias=self.C_bias.to(torch.float32),
             K_bias=self.B_bias.to(torch.float32),
             MIMO_V=self.in_proj_mimo_x.to(torch.float32),
             MIMO_Z=self.in_proj_mimo_z.to(torch.float32),
             MIMO_Out=self.out_proj_mimo.to(torch.float32),
-            Angles=angle.to(torch.float32).contiguous(),
+            Angles=_canon_strides(angle.to(torch.float32)),
             D=self.D.to(torch.float32).contiguous(),
-            Z=z.contiguous(),
+            Z=_canon_strides(z),
             chunk_size=self.chunk_size,
             rotary_dim_divisor=self.rotary_dim_divisor,
             dtype=x.dtype,
             return_state=False,
+            cu_seqlens=cu_seqlens,
         )
         if isinstance(y, tuple):
             y, new_state = y
+        # Canonicalize grad strides for the varlen backward (B=1 collapse).
+        y = _CanonGradStrides.apply(y)
         nvtx_range_pop(suffix="M3_mimo_chunk_scan")
 
         y = rearrange(y, "b l h p -> l b (h p)")
 
         y = self.output_norm(y)
-
-        if self.config.artificial_seq_len > 0:
-            y = y.reshape(seq_len, batch_size, -1)
 
         return y, normed_hidden_states
 

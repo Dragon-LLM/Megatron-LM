@@ -816,7 +816,7 @@ def validate_args(args, defaults={}):
     # across batches/microbatches. Due to additional communication overhead
     # during pipeline parallelism, it should not be set if sequence length
     # is constant during training.
-    args.variable_seq_lengths = False
+    args.variable_seq_lengths = args.sft
 
     # Iteration-based training.
     if args.train_iters:
@@ -1761,6 +1761,13 @@ def _add_dragon_args(parser):
     group.add_argument('--intra-doc-masking', action='store_true')
     group.add_argument('--training-sequence-length', type=int, default=2048)
     group.add_argument('--slw-warmup-steps', type=int, default=0)
+    group.add_argument('--slw-warmup-offset', type=int, default=0,
+                       help='Training iteration at which the sliding-window warmup starts. '
+                       'Before this iter, the window stays at --slw-start; the linear ramp '
+                       'to --slw-end then runs from this iter for --slw-warmup-steps iters. '
+                       'Useful when resuming a job (e.g. annealing) where the window should '
+                       'ramp during a sub-phase rather than from iter 0. Default 0 preserves '
+                       'the legacy behavior.')
     group.add_argument('--slw-start', type=int, default=0)
     group.add_argument('--slw-end', type=int, default=0)
     group.add_argument('--slw-increment', type=int, default=0)
@@ -3049,8 +3056,12 @@ def _add_data_args(parser):
     group.add_argument('--no-create-attention-mask-in-dataloader', action='store_false',
                        help='If set, do not create attention_masks in dataloader.',
                        dest='create_attention_mask_in_dataloader')
-    group.add_argument('--create-cu-seqlens-in-dataloader', action='store_true',
-                       help='If set, create cu_seqlens in dataloader.')
+    group.add_argument('--create-cu-seqlens-in-dataloader', action='store_true', default=True,
+                       help='Create cu_seqlens in dataloader (default ON). '
+                            'Disable with --no-create-cu-seqlens-in-dataloader.')
+    group.add_argument('--no-create-cu-seqlens-in-dataloader', action='store_false',
+                       dest='create_cu_seqlens_in_dataloader',
+                       help='Disable cu_seqlens creation in the dataloader.')
     group.add_argument('--num-dataset-builder-threads', type=int, default=1,
                        help='Number of parallel threads per rank for dataset builder')
     group.add_argument('--object-storage-cache-path', type=str, default=None,

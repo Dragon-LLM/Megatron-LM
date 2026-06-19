@@ -2,29 +2,27 @@
 
 """SFT tokenizer."""
 from typing import Dict, List, Union
-import numpy as np
-
-nemotron_h_aligned_custom_template = """{% for message in messages %}{% if message['role'] == 'system' %}{{ '<SPECIAL_10>System\n' + message['content'].strip() + '\n' }}{% elif message['role'] == 'user' %}{{ '<SPECIAL_11>User\n' + message['content'].strip() + '\n' + '<SPECIAL_11>Assistant\n' }}{% elif message['role'] == 'assistant' %}{{ message['content'].strip() + '\n' }}{% endif %}{% endfor %}"""
-nemotron_nano_v2_custom_template = """{% for message in messages %}{% set content = message['content'] %}{% if message['role'] == 'system' %}{{ '<SPECIAL_10>System\n' + content.replace('/think', '').replace('/no_think', '').strip() + '\n' }}{% elif message['role'] == 'user' %}{{ '<SPECIAL_11>User\n' + content.replace('/think', '').replace('/no_think', '').strip() + '\n' }}{% elif message['role'] == 'assistant' %}{{ '<SPECIAL_11>Assistant\n' + content.strip() + '\n<SPECIAL_12>\n' }}{% endif %}{% endfor %}"""
 
 from megatron.core.datasets.megatron_tokenizer import MegatronLegacyTokenizer
-from megatron.training.datasets.sft_dataset import IGNORE_INDEX
-from megatron.training.tokenizer.multimodal_tokenizer import PromptConfig
 
-class SFTTokenizer(MegatronLegacyTokenizer):  
-    """SFT Tokenizer."""
+
+class SFTTokenizer(MegatronLegacyTokenizer):
+    """SFT Tokenizer.
+
+    Thin wrapper around a HuggingFace tokenizer that relies on the tokenizer's
+    own chat template (with assistant-token masking) to build the loss mask.
+    """
 
     def __init__(
         self,
         tokenizer_path: str,
-        prompt_format: str,
+        prompt_format: str = None,
     ):
         """
-        Note: Currently, only HuggingFaceTokenizer is supported as the underlying text tokenizer.
-
         Args:
-            tokenizer_path (str): Underlying tokenizer path.
-            prompt_format (str): Prompt format for the tokenizer.
+            tokenizer_path (str): Underlying HuggingFace tokenizer path.
+            prompt_format (str): Unused; kept for build_tokenizer compatibility.
+                The chat template baked into the HuggingFace tokenizer is used.
         """
         super().__init__(tokenizer_path, prompt_format=prompt_format)
         try:
@@ -34,113 +32,56 @@ class SFTTokenizer(MegatronLegacyTokenizer):
                 "SFTTokenizer currently requires transformers library to be installed"
             )
 
-        # Currently, only HuggingFace tokenizers are supported.
         tokenizer = transformers.AutoTokenizer.from_pretrained(
             pretrained_model_name_or_path=tokenizer_path,
         )
 
-        self._vocab_size = len(tokenizer)
         self._tokenizer = tokenizer
-
-        if prompt_format == "nemotron-nano-v2":
-            self._prompt_config = PromptConfig(
-                assistant_prefix_len=3,
-                pad_token_id=tokenizer.convert_tokens_to_ids("<unk>"),
-                custom_chat_template=nemotron_nano_v2_custom_template,
-                has_bos=False,
-                has_system_role=True,
-            )
-        elif prompt_format == "nemotron-h-aligned":
-            self._prompt_config = PromptConfig(
-                assistant_prefix_len=0,
-                pad_token_id=tokenizer.convert_tokens_to_ids("<SPECIAL_233>"),
-                custom_chat_template=nemotron_h_aligned_custom_template,
-                has_bos=False,
-                has_system_role=True,
-            )
-        else:
-            raise NotImplementedError("unknown SFT prompt format", prompt_format)
-
+        self._vocab_size = len(tokenizer)
         self._prompt_format = prompt_format
 
-
-    def tokenize_conversation(
-        self, conversation: List[Dict], return_target: bool, add_generation_prompt: bool
-    ):
-        """Convert a conversation to tokens.
+    def tokenize_conversation(self, sample):
+        """Convert a conversation to (tokens, assistant loss mask).
 
         Args:
-            conversation (List[Dict]): Sequence of system/user/assistant messages.
+            sample (Dict): A data sample with key "messages" (List[Dict]) - a
+                sequence of system/user/assistant messages - and an optional
+                "chat_template_kwargs" dict forwarded to apply_chat_template.
                 Must be in the following format:
                 [
                     {"role": "system", "content": "something"},
                     {"role": "user", "content": "something1"},
                     {"role": "assistant", "content": "something2"},
                 ]
-            return_target (bool): Return target tokens with system and assistant masked.
-            add_generation_prompt (bool): Add assistant prefix to the end.
+
+        Returns:
+            (input_ids, assistant_masks): the token ids and a mask that is 1 on
+            assistant tokens (the tokens to train on) and 0 elsewhere. The mask
+            is NOT shifted; the causal shift is applied by the dataset.
         """
-        # Skip system message if the tokenizer doesn't have a system role.
-        if not self._prompt_config.has_system_role and conversation[0]["role"] == "system":
-            conversation = conversation[1:]
-
-        tokens = self._tokenizer.apply_chat_template(
-            conversation,
+        out = self._tokenizer.apply_chat_template(
+            sample["messages"],
             tokenize=True,
-            add_generation_prompt=add_generation_prompt,
-            return_assistant_token_mask=False,
+            add_generation_prompt=False,
+            return_assistant_tokens_mask=True,
             return_tensors="np",
-            chat_template=self._prompt_config.custom_chat_template,
-        )[0]
+            return_dict=True,
+            **sample.get("chat_template_kwargs", {}),
+        )
 
-        if not return_target:
-            return tokens
-
-        target = tokens.copy()
-
-        # Mask system and user tokens in the target.
-        idx = 0
-        for turn_idx, turn in enumerate(conversation):
-            
-            if turn["role"].lower() == "assistant" and len(turn["content"]) == 0:
-                raise ValueError(f"empty assistant turn in conversation: {conversation}.")
-            if turn["role"].lower() == "assistant":
-                assert conversation[turn_idx-1]["role"].lower() == "user"
-
-            turn_tokens = self._tokenizer.apply_chat_template(
-                [turn], tokenize=True, chat_template=self._prompt_config.custom_chat_template
-            )
-
-            # There should be only one BOS at the very beginning.
-            # After the first turn, skip BOS token.
-            if self._prompt_config.has_bos and turn_idx > 0:
-                turn_tokens = turn_tokens[1:]
-            turn_len = len(turn_tokens)
-
-            role = turn["role"].lower()
-            if role in ("system", "user"):
-                target[idx : idx + turn_len] = IGNORE_INDEX
-            elif role == "assistant":
-                if self._prompt_config.assistant_prefix_len > 0:
-                    target[idx : idx + self._prompt_config.assistant_prefix_len] = IGNORE_INDEX
-            else:
-                raise ValueError(f"Wrong role value.")
-
-            assert np.allclose(
-                tokens[idx : idx + turn_len], turn_tokens
-            ), f"expected turn tokens to match tokens in conversation {conversation}"
-
-            idx += turn_len
-        
-        assert idx == len(tokens), f"mismatch in target masking the conversation {conversation}"
-
-        return tokens, target
+        return out["input_ids"][0], out["assistant_masks"][0]
 
     def tokenize(self, text: Union[str, List[Dict]]):
         """Tokenize conversation or string input."""
         if isinstance(text, list):
-            # This code path is used by the inference code currently.
-            return self.tokenize_conversation(text, return_target=False, add_generation_prompt=True).tolist()
+            # Inference path: render the prompt with an assistant generation prefix.
+            out = self._tokenizer.apply_chat_template(
+                text,
+                tokenize=True,
+                add_generation_prompt=True,
+                return_tensors="np",
+            )
+            return out[0].tolist()
 
         return self._encode(text)
 
@@ -161,14 +102,10 @@ class SFTTokenizer(MegatronLegacyTokenizer):
         return self._tokenizer.get_added_vocab()
 
     @property
-    def force_eod(self):
-        """To force an EOD at the end of every data sample in SFT."""
-        return self._prompt_format == "nemotron-h-aligned"
-
-    @property
     def pad(self):
         """Pad token ID."""
-        return self._prompt_config.pad_token_id
+        pad_id = self._tokenizer.pad_token_id
+        return pad_id if pad_id is not None else self._tokenizer.eos_token_id
 
     @property
     def eod(self):

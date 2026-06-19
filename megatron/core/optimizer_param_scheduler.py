@@ -27,6 +27,9 @@ class OptimizerParamScheduler:
         wd_incr_steps (int): number of weight decay increment steps
         wd_incr_style (str): weight decay increment style
         slw_warmup_steps (int, optional): number of steps to warmup the sliding window over
+        slw_warmup_offset (int, optional): training iteration at which the sliding-window
+            warmup starts. Before this iter, window == slw_start. Useful for
+            ramping the window during a continuation (e.g. annealing) phase.
         slw_start (int, optional): starting window size for sliding window
         slw_end (int, optional): ending window size for sliding window
         slw_increment (int, optional): increment for sliding window
@@ -62,6 +65,7 @@ class OptimizerParamScheduler:
         wd_incr_steps: int,
         wd_incr_style: str,
         slw_warmup_steps: int = 0,
+        slw_warmup_offset: int = 0,
         slw_start: int = 0,
         slw_end: int = 0,
         slw_increment: int = 0,
@@ -111,6 +115,7 @@ class OptimizerParamScheduler:
         self.wd_incr_style = wd_incr_style
 
         self.slw_warmup_steps = slw_warmup_steps
+        self.slw_warmup_offset = slw_warmup_offset
         self.slw_start = slw_start
         self.slw_end = slw_end
         self.slw_increment = slw_increment
@@ -230,8 +235,10 @@ class OptimizerParamScheduler:
     def get_wsize(self) -> int:
         if self.slw_warmup_steps == 0:
             return self.slw_end
-        progress_ratio = (self.num_steps / self.global_batch_size) / self.slw_warmup_steps
-        window = self.slw_start + progress_ratio * (self.slw_end - self.slw_start) # linear scheduling        
+        current_iter = self.num_steps / self.global_batch_size
+        progress_ratio = (current_iter - self.slw_warmup_offset) / self.slw_warmup_steps
+        progress_ratio = max(0.0, min(1.0, progress_ratio))  # clamp to [0, 1]
+        window = self.slw_start + progress_ratio * (self.slw_end - self.slw_start) # linear scheduling
         window = self.slw_increment * math.ceil(window / self.slw_increment) # quantize
         window = int(min(window, self.slw_end)) # cap
 

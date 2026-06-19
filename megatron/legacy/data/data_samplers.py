@@ -73,6 +73,9 @@ class MegatronPretrainingSampler:
         # Keep a copy of input params for later use.
         self.total_samples = total_samples
         self.consumed_samples = consumed_samples
+        if get_args().reset_training:
+            print("Reset training: resetting consumed samples to 0")
+            self.consumed_samples = 0
         self.micro_batch_size = micro_batch_size
         self.data_parallel_rank = data_parallel_rank
         self.micro_batch_times_data_parallel_size = \
@@ -145,6 +148,9 @@ class MegatronPretrainingRandomSampler:
         self.dataset = dataset
         self.total_samples = total_samples
         self.consumed_samples = consumed_samples
+        if get_args().reset_training:
+            print("Reset training: resetting consumed samples to 0")
+            self.consumed_samples = 0
         self.micro_batch_size = micro_batch_size
         self.data_parallel_rank = data_parallel_rank
         self.data_parallel_size = data_parallel_size

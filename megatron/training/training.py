@@ -1008,6 +1008,11 @@ def pretrain(
         print_datetime('after training is done')
 
         if args.save and iteration != 0 and iteration % args.save_interval != 0:
+            # Mirror save_checkpoint_and_time: reclaim memory before the end-of-training
+            # save, which is called directly here (not through save_checkpoint_and_time)
+            # and would otherwise OOM on the last save with full training state resident.
+            gc.collect()
+            torch.cuda.empty_cache()
             save_checkpoint(
                 iteration,
                 model,
@@ -1018,6 +1023,8 @@ def pretrain(
                 train_data_iterator=train_data_iterator,
                 preprocess_common_state_dict_fn=preprocess_common_state_dict,
             )
+            gc.collect()
+            torch.cuda.empty_cache()
 
         one_logger and one_logger.log_metrics(
             {'app_train_loop_finish_time': one_logger_utils.get_timestamp_in_ms()}
@@ -1316,6 +1323,7 @@ def get_optimizer_param_scheduler(optimizer):
         wd_incr_steps=wd_incr_steps,
         wd_incr_style=args.weight_decay_incr_style,
         slw_warmup_steps=args.slw_warmup_steps,
+        slw_warmup_offset=args.slw_warmup_offset,
         slw_start=args.slw_start,
         slw_end=args.slw_end,
         slw_increment=args.slw_increment,
@@ -1461,7 +1469,7 @@ def setup_model_and_optimizer(
         )
         timers('load-checkpoint', log_level=0).start(barrier=True)
 
-        args.iteration, args.num_floating_point_operations_so_far = load_checkpoint(
+        iters, args.num_floating_point_operations_so_far = load_checkpoint(
             model,
             optimizer,
             opt_param_scheduler,
@@ -1470,6 +1478,11 @@ def setup_model_and_optimizer(
             and getattr(args, "use_torch_fsdp2", False)
             and args.ckpt_format == "torch_dist",
         )
+        if not args.reset_training:
+            args.iteration = iters
+        else:
+            print("Reset training: setting iteration to 0.")
+            args.iteration = 0
         timers('load-checkpoint').stop(barrier=True)
         timers.log(['load-checkpoint'])
         one_logger and one_logger.log_metrics(

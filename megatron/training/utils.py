@@ -588,6 +588,39 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
             ),
         }
 
+        # SFT length handling. Two mutually exclusive modes:
+        #  - PACKED (cu_seqlens present in the data): each sample is a full
+        #    seq_length pack with document boundaries in cu_seqlens. We must NOT
+        #    truncate (that would slice through packed docs and invalidate
+        #    cu_seqlens); the full sequence + cu_seqlens are carried through via
+        #    the create_cu_seqlens_in_dataloader broadcast path below.
+        #  - UNPACKED bucketing (legacy): truncate the micro-batch to a bucketed
+        #    length (longest real sample, rounded to a fixed bucket) for
+        #    throughput on short samples.
+        # Use a GLOBAL arg (same on every rank) to pick the mode, so src and
+        # non-src ranks agree on whether the bucket-length broadcast happens.
+        sft_packed = args.sft and args.create_cu_seqlens_in_dataloader
+        if args.sft and not sft_packed:
+            assert not args.create_attention_mask_in_dataloader, "please take a look at this part of the code, it might be wrong"
+
+            BUCKETS_ALL = (128, 256, 384, 512, 768, 1024, 1280, 1536, 1792, 2048,
+                    3072, 4096, 5120, 6016, 7040, 8192, 10112, 12032,
+                    14080, 16000, 18048, 20096)
+            BUCKETS = tuple(b for b in BUCKETS_ALL if b <= args.seq_length)
+
+            nt = min(int(data['num_tokens'].max().item()), args.seq_length)
+            nt = min(BUCKETS, key=lambda b: abs(b - nt)) if BUCKETS else nt
+
+            batch['tokens'] = batch['tokens'][:, 0:nt]
+            batch['labels'] = batch['labels'][:, 0:nt]
+            batch['loss_mask'] = batch['loss_mask'][:, 0:nt]
+            if batch['attention_mask'] is not None:
+                batch['attention_mask'] = batch['attention_mask'][:, :, 0:nt, 0:nt]
+            batch['position_ids'] = batch['position_ids'][:, 0:nt]
+
+            _len = torch.tensor([nt], dtype=torch.int64, device=torch.cuda.current_device())
+            torch.distributed.broadcast(_len, mpu.get_tensor_model_parallel_src_rank(), group=mpu.get_tensor_model_parallel_group())
+
         if args.pipeline_model_parallel_size == 1 or mtp_on_this_rank:
             _broadcast(batch['tokens'])
             _broadcast(batch['labels'])
@@ -628,31 +661,42 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
 
     else:
 
+        # SFT length receive. Mirror the src-rank logic: in PACKED mode (cu_seqlens
+        # created in the dataloader) there is no bucket-length broadcast and the
+        # sequence is full seq_length; in legacy bucketing mode, receive nt.
+        sft_packed = args.sft and args.create_cu_seqlens_in_dataloader
+        if args.sft and not sft_packed:
+            _len = torch.empty(1, dtype=torch.int64, device=torch.cuda.current_device())
+            torch.distributed.broadcast(_len, mpu.get_tensor_model_parallel_src_rank(), group=mpu.get_tensor_model_parallel_group())
+            nt = int(_len.item())
+        else:
+            nt = args.seq_length
+
         tokens = torch.empty(
-            (args.micro_batch_size, args.seq_length),
+            (args.micro_batch_size, nt),
             dtype=torch.int64,
             device=torch.cuda.current_device(),
         )
         labels = torch.empty(
-            (args.micro_batch_size, args.seq_length),
+            (args.micro_batch_size, nt),
             dtype=torch.int64,
             device=torch.cuda.current_device(),
         )
         loss_mask = torch.empty(
-            (args.micro_batch_size, args.seq_length),
+            (args.micro_batch_size, nt),
             dtype=torch.float32,
             device=torch.cuda.current_device(),
         )
         if args.create_attention_mask_in_dataloader:
             attention_mask = torch.empty(
-                (args.micro_batch_size, 1, args.seq_length, args.seq_length),
+                (args.micro_batch_size, 1, nt, nt),
                 dtype=torch.bool,
                 device=torch.cuda.current_device(),
             )
         else:
             attention_mask = None
         position_ids = torch.empty(
-            (args.micro_batch_size, args.seq_length),
+            (args.micro_batch_size, nt),
             dtype=torch.int64,
             device=torch.cuda.current_device(),
         )
